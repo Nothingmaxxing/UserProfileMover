@@ -16,7 +16,8 @@ function Throws([scriptblock]$Block, [string]$Like) {
 # ---------------------------------------------------------------- 1. синтаксис
 
 $asts = @{}
-foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File -Include '*.ps1', '*.psd1' | Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' })) {
+# Фильтр по расширению, а не -Include: в Windows PowerShell 5.1 -Include вместе с -LiteralPath не работает
+foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.Extension -in @('.ps1', '.psd1') -and $_.FullName -notmatch '[\\/]\.git[\\/]' })) {
     $t = $null; $e = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$t, [ref]$e)
     Check ('синтаксис {0}' -f $f.Name) (-not $e.Count)
@@ -259,7 +260,9 @@ else {
         Check '7-Zip: архив создан' ((Test-Path -LiteralPath $arch) -and $size -gt 0 -and $res7[0].Status -eq 'ok' -and $res7[0].Key -eq 'Archive')
         Check '7-Zip: пароль подходит' ((Test-ArchivePassword $arch $pw) -eq '')
         Check '7-Zip: неверный пароль' ((Test-ArchivePassword $arch 'Wrong-password-1') -eq 'Неверный пароль копии.')
-        Check '7-Zip: без пароля имена файлов не видны' (-not ((& $z7 l -p'' -- $arch 2>&1) -join "`n" -like '*документ*'))
+        # Через Invoke-7z, а не & 7z 2>&1: в Windows PowerShell 5.1 stderr программы при ErrorAction Stop обрывает скрипт
+        $lst = Invoke-7z @('l', '--', $arch) 'Wrong-password-1' 'test'
+        Check '7-Zip: без пароля имена файлов не видны' ($lst.Code -ge 2 -and $lst.Output -notlike '*документ*' -and $lst.Output -notlike '*DPAPI*')
         $out = Join-Path $zt 'out'
         New-Item -ItemType Directory -Path $out | Out-Null
         Expand-Copy $arch $out $pw
