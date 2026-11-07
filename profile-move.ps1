@@ -8,6 +8,7 @@
 #    → <StoreRoot>\<логин>\<дата>_<время>_<ПК>.
 #  - «Развернуть на ПК»: то же обратно в профиль сотрудника на новом ПК (сотрудник должен один раз войти туда).
 #  - «Перенести сразу»: оба шага подряд, когда старый и новый ПК включены.
+#  - «Акт»: акт переноса для печати и подписи (HTML), после развёртывания окно предлагает открыть его само.
 # На старом ПК ничего не удаляется и не меняется. Для реестра ПК окно на время работы включает службу
 # «Удалённый реестр» и потом возвращает её как было. Пароли и куки браузеров на Chromium переносятся вместе
 # с ключами DPAPI: учётка доменная, SID тот же, поэтому на новом ПК Windows их расшифрует.
@@ -69,6 +70,7 @@ try {
     $script:Cfg = Import-PowerShellDataFile -Path (Join-Path $script:Root 'config.psd1')
     if (-not $script:Cfg.Domain) { $script:Cfg.Domain = $env:USERDNSDOMAIN }
     if ($null -eq $script:Cfg.EnableCryptoPro) { $script:Cfg.EnableCryptoPro = $true }
+    if ($null -eq $script:Cfg.Act) { $script:Cfg.Act = $true }
     $script:Browsers = @(Initialize-Browsers $script:Cfg)
 } catch {
     if ($NoGui) { throw }
@@ -1242,6 +1244,11 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
         } catch { Write-Log ('   запись о развёртывании в manifest.json не сохранена: ' + $_.Exception.Message) 'warn' }
         try { Update-Grid } catch { }
     }
+    $act = ''
+    if ($script:Cfg.Act) {
+        try { $act = New-Act $m $rec; Write-Log ('   акт переноса: {0}' -f $act) }
+        catch { Write-Log ('   акт переноса не составлен: ' + $_.Exception.Message) 'warn' }
+    }
 
     $st = Get-Worst $results
     Write-Log ('=== Развёрнуто: {0} на {1} за {2}{3}' -f $user.Login, $pc.Name, (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { '. Есть замечания, см. выше' } else { '' })) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
@@ -1271,6 +1278,7 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
         Head     = ('Готово: {0} ({1}) на {2}.' -f $user.Name, $user.Login, $pc.Name)
         LongText = (Get-LongPathText)
         Checks   = $txt
+        Act      = $act
     }
 }
 
@@ -1306,10 +1314,12 @@ function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$
         Head     = ('Перенесено: {0} ({1}) с {2} на {3}, {4} за {5}.' -f $user.Name, $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span)
         LongText = ($cap.LongText + $res.LongText)
         Checks   = $res.Checks
+        Act      = $res.Act
     }
 }
 
-# Итоговое сообщение: заголовок, замечания, не скопированные из-за длинного имени, что проверить, что дальше
+# Итоговое сообщение: заголовок, замечания, не скопированные из-за длинного имени, что проверить, что дальше.
+# Если составлен акт переноса, предлагает открыть его
 function Show-Result($R, [string]$Tail = '') {
     $n = "`r`n"
     $txt = $R.Head + $n + $n
@@ -1317,7 +1327,168 @@ function Show-Result($R, [string]$Tail = '') {
     $txt += $R.LongText
     if ($R.PSObject.Properties['Checks'] -and $R.Checks) { $txt += $R.Checks }
     if ($Tail) { $txt += $Tail }
-    [void](Show-Msg $txt.TrimEnd() $(if ($R.Status -eq 'ok') { 'Information' } else { 'Warning' }))
+    $icon = if ($R.Status -eq 'ok') { 'Information' } else { 'Warning' }
+    if ($R.PSObject.Properties['Act'] -and $R.Act) {
+        $txt = $txt.TrimEnd() + $n + $n + 'Открыть акт переноса для печати и подписи?'
+        if ((Show-Msg $txt $icon 'YesNo') -eq 'Yes') { Open-Act $R.Act }
+        return
+    }
+    [void](Show-Msg $txt.TrimEnd() $icon)
+}
+
+# ---------------------------------------------------------------- акт переноса
+
+function ConvertTo-HtmlText($S) { return [System.Net.WebUtility]::HtmlEncode([string]$S) }
+
+function Get-ActStatus([string]$S) {
+    switch ($S) {
+        'ok'   { return 'перенесено' }
+        'warn' { return 'с замечаниями' }
+        'err'  { return 'ошибка' }
+        'skip' { return 'пропущено' }
+        default { return $S }
+    }
+}
+
+# Акт: кто, откуда, куда, что перенесено и сколько, итог, строки для подписи. $Rec: запись о развёртывании
+# из manifest.json; $null, если копию ещё не разворачивали (тогда акт о резервной копии).
+# Лежит в logs\acts на этом ПК: браузер, который его откроет, ходит в сеть под вашей учёткой Windows,
+# а не под учёткой окна, и до хранилища копий может не достать
+function New-Act($M, $Rec) {
+    $h = ${function:ConvertTo-HtmlText}
+    $n = "`r`n"
+    $restored = [bool]$Rec
+    $when = if ($restored) { [datetime]$Rec.Date } else { [datetime]$M.Created }
+    $pcTo = if ($restored) { [string]$Rec.PC } else { '' }
+    $src = if ($restored) { $Rec.Items } else { $M.Items }
+    # «нечего переносить» (папки или браузера на ПК не было) в акт не пишем
+    $items = @(@($src) | Where-Object { $_ -and [string]$_.Status -notin @('none', '') -and [string]$_.Key -ne 'Archive' })
+    $worst = Get-Worst $items
+    if ($worst -eq 'ok' -and @($items | Where-Object { [string]$_.Status -eq 'skip' }).Count) { $worst = 'warn' }   # пропущенное = замечание
+    $kind = if (-not $restored) { 'резервного копирования данных пользователя' }
+            elseif ($pcTo -ieq [string]$M.SourcePC) { 'восстановления данных пользователя на компьютере' }
+            else { 'переноса данных пользователя на другой компьютер' }
+
+    $rows = New-Object Text.StringBuilder
+    $i = 0
+    foreach ($it in $items) {
+        $i++
+        $k = [string]$it.Key
+        $title = if ($script:Titles.Contains($k)) { $script:Titles[$k] } else { [string]$it.Title }
+        $files = if ([long]$it.Files -gt 0) { '{0:N0}' -f [long]$it.Files } else { '—' }
+        $size = if ([long]$it.Bytes -gt 0) { Format-Size ([long]$it.Bytes) } else { '—' }
+        [void]$rows.Append(('<tr><td class="c">{0}</td><td>{1}</td><td class="r">{2}</td><td class="r">{3}</td><td>{4}</td><td>{5}</td></tr>{6}' -f
+            $i, (& $h $title), (& $h $files), (& $h $size), (& $h (Get-ActStatus ([string]$it.Status))), (& $h $it.Note), $n))
+    }
+    if (-not $i) { [void]$rows.Append(('<tr><td colspan="6">{0}</td></tr>' -f (& $h 'ничего не перенесено'))) }
+
+    $info = New-Object Text.StringBuilder
+    $addInfo = { param($k, $v) [void]$info.Append(('<tr><td class="k">{0}</td><td>{1}</td></tr>{2}' -f (& $h $k), $v, $n)) }
+    & $addInfo 'Сотрудник:' ('<b>{0}</b> ({1})' -f (& $h $M.Name), (& $h $M.Login))
+    & $addInfo $(if ($restored -and $pcTo -ine [string]$M.SourcePC) { 'Старый компьютер:' } else { 'Компьютер:' }) ('{0}, копия данных снята {1}' -f (& $h $M.SourcePC), (& $h ([datetime]$M.Created).ToString('dd.MM.yyyy HH:mm')))
+    if ($restored -and $pcTo -ine [string]$M.SourcePC) { & $addInfo 'Новый компьютер:' ('{0}, данные перенесены {1}' -f (& $h $pcTo), (& $h $when.ToString('dd.MM.yyyy HH:mm'))) }
+    elseif ($restored) { & $addInfo 'Восстановлено:' (& $h $when.ToString('dd.MM.yyyy HH:mm')) }
+    & $addInfo 'Учётная запись исполнителя:' (& $h $(if ($restored) { $Rec.Operator } else { $M.Operator }))
+
+    $sum = if (-not $i) { 'Данные не перенесены.' }
+           elseif ($worst -eq 'ok') { 'Данные перенесены полностью, замечаний нет.' }
+           else { 'Данные перенесены с замечаниями, см. графу «Примечание».' }
+    if (-not $restored) { $sum = if ($worst -eq 'ok') { 'Копия данных снята полностью, замечаний нет.' } else { 'Копия данных снята с замечаниями, см. графу «Примечание».' } }
+
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{0}</title>
+<style>
+@page {{ size: A4; margin: 15mm 15mm 15mm 20mm; }}
+body {{ font-family: "Times New Roman", Times, serif; font-size: 12pt; color: #000; max-width: 175mm; margin: 16px auto; }}
+.org {{ text-align: center; margin-bottom: 18px; }}
+h1 {{ font-size: 14pt; text-align: center; margin: 0; letter-spacing: 2px; }}
+.sub {{ text-align: center; font-weight: bold; margin: 2px 0 14px; }}
+.date {{ text-align: right; margin-bottom: 12px; }}
+table {{ border-collapse: collapse; }}
+.info td {{ padding: 2px 10px 2px 0; vertical-align: top; }}
+.info td.k {{ white-space: nowrap; }}
+.items {{ width: 100%; margin: 8px 0 12px; font-size: 11pt; }}
+.items th, .items td {{ border: 1px solid #000; padding: 3px 5px; vertical-align: top; }}
+.items th {{ font-weight: bold; text-align: center; }}
+.items td.r {{ text-align: right; white-space: nowrap; }}
+.items td.c {{ text-align: center; }}
+.sign {{ width: 100%; margin-top: 26px; }}
+.sign td {{ padding: 0 8px 0 0; vertical-align: bottom; }}
+.sign td.line {{ border-bottom: 1px solid #000; height: 30px; width: 32%; }}
+.sign td.cap {{ font-size: 9pt; text-align: center; padding-bottom: 12px; }}
+.foot {{ font-size: 9pt; color: #555; margin-top: 24px; }}
+.noprint {{ margin-bottom: 12px; }}
+@media print {{ .noprint {{ display: none; }} body {{ margin: 0; }} }}
+</style>
+</head>
+<body>
+<div class="noprint"><button onclick="window.print()">{1}</button></div>
+<div class="org">{2}</div>
+<h1>{3}</h1>
+<div class="sub">{4}</div>
+<div class="date">{5}</div>
+<table class="info">
+{6}</table>
+<p>{7}</p>
+<table class="items">
+<tr><th>№</th><th>{8}</th><th>{9}</th><th>{10}</th><th>{11}</th><th>{12}</th></tr>
+{13}</table>
+<p>{14}</p>
+<p>{15}</p>
+<table class="sign">
+<tr><td>{16}</td><td class="line"></td><td class="line"></td></tr>
+<tr><td></td><td class="cap">{17}</td><td class="cap">{18}</td></tr>
+<tr><td>{19}</td><td class="line"></td><td class="line">{20}</td></tr>
+<tr><td></td><td class="cap">{21}</td><td class="cap">{18}</td></tr>
+</table>
+<div class="foot">{22}</div>
+</body>
+</html>
+"@ -f (& $h ('{0}: {1}, {2}' -f 'Акт', $M.Name, $when.ToString('dd.MM.yyyy'))),
+        (& $h 'Печать'),
+        (& $h $script:Cfg.OrgName),
+        (& $h 'АКТ'),
+        (& $h $kind),
+        (& $h $when.ToString('dd.MM.yyyy')),
+        $info.ToString(),
+        (& $h $(if ($restored) { 'Перенесены данные:' } else { 'В копию сняты данные:' })),
+        (& $h 'Данные'), (& $h 'Файлов'), (& $h 'Объём'), (& $h 'Итог'), (& $h 'Примечание'),
+        $rows.ToString(),
+        (& $h $sum),
+        (& $h ('На компьютере, с которого сняты данные, ничего не удалялось и не изменялось. Копия данных хранится {0} дней, затем удаляется.' -f $script:Cfg.RetentionDays)),
+        (& $h 'Перенос выполнил'),
+        (& $h 'подпись'), (& $h 'фамилия, инициалы'),
+        (& $h 'Данные проверил, претензий нет'),
+        (& $h $M.Name),
+        (& $h 'подпись сотрудника'),
+        (& $h ('Составлено окном «Перенос профиля», {0}, {1}' -f $script:Version, (Get-Date).ToString('dd.MM.yyyy HH:mm')))
+
+    $dir = Join-Path $script:LogDir 'acts'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $path = Join-Path $dir ('{0}_{1}_{2}.html' -f $when.ToString('yyyy-MM-dd_HHmm'), $M.Login, $(if ($restored) { $pcTo } else { $M.SourcePC }))
+    [IO.File]::WriteAllText($path, $html, (New-Object Text.UTF8Encoding($true)))
+    return $path
+}
+
+function Open-Act([string]$Path) {
+    try { Start-Process -FilePath $Path }
+    catch { [void](Show-Msg ('Акт не открылся: {0}{1}{1}Файл: {2}' -f $_.Exception.Message, "`r`n", $Path) 'Warning') }
+}
+
+# Акт по выбранной копии: по последнему развёртыванию, если его не было, то о резервной копии
+function Show-ActForCopy {
+    $c = Get-SelectedCopy
+    if (-not $c) { throw 'Выберите копию в списке' }
+    $m = Read-Manifest $c.Path
+    if (-not $m) { throw 'В копии нет manifest.json: акт составить не из чего' }
+    $rec = @($m.Restores) | Where-Object { $_ } | Select-Object -Last 1
+    $p = New-Act $m $rec
+    Write-Log ('=== Акт по копии {0}: {1}' -f $c.Path, $p) 'head'
+    Open-Act $p
 }
 
 # ---------------------------------------------------------------- окна
@@ -1555,6 +1726,7 @@ try {
         (New-Btn 'Снять с ПК…' 110 { Invoke-Guarded { Show-CaptureDialog } })
         (New-Btn 'Развернуть на ПК…' 140 { Invoke-Guarded { Show-RestoreDialog } })
         (New-Btn 'Подробно' 90 { Invoke-Guarded { Show-CopyDetails } })
+        (New-Btn 'Акт' 60 { Invoke-Guarded { Show-ActForCopy } })
         (New-Btn 'Удалить копию' 115 { Invoke-Guarded {
             $c = Get-SelectedCopy
             if (-not $c) { throw 'Выберите копию в списке' }

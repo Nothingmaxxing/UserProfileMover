@@ -45,7 +45,7 @@ $script:MsgAnswer = 'Cancel'
 
 . (Get-Fn 'Initialize-Browsers', 'Get-ExcludeArgs', 'Test-BrowserRunning', 'Wait-BrowserClosed', 'Get-BrowserJobs', 'Test-Locked',
     'Get-ErrCode', 'New-ItemResult', 'Write-ItemLog', 'Get-CopyHas', 'Format-Size', 'Format-Span', 'Get-Worst', 'ConvertFrom-RoboError',
-    'Invoke-Move', 'Show-Result')
+    'Invoke-Move', 'Show-Result', 'ConvertTo-HtmlText', 'Get-ActStatus', 'New-Act')
 
 # ---------------------------------------------------------------- 3. config.example.psd1 и браузеры
 
@@ -178,6 +178,38 @@ Show-Result $mv
 Check 'итоговое сообщение: заголовок, замечания, что проверить' ($script:Shown.Text -like ($mv.Head + '*замечания*Проверить с сотрудником*') -and $script:Shown.Icon -eq 'Warning')
 Show-Result ([pscustomobject]@{ Status = 'ok'; Head = 'Копия снята.'; LongText = '' }) 'Дальше: развернуть.'
 Check 'итоговое сообщение: без замечаний' ($script:Shown.Text -eq ('Копия снята.' + "`r`n`r`n" + 'Дальше: развернуть.') -and $script:Shown.Icon -eq 'Information')
+
+# ---------------------------------------------------------------- 7. акт переноса
+
+$script:LogDir = Join-Path ([IO.Path]::GetTempPath()) ('pmtest-logs-' + [guid]::NewGuid().ToString('N'))
+$script:Version = 'profile-move test'
+$script:Titles = [ordered]@{ Desktop = 'Рабочий стол'; Yandex = 'Яндекс Браузер'; Dpapi = 'Ключи DPAPI' }
+$script:Cfg = @{ RetentionDays = 30; OrgName = 'ООО <Ромашка> & Ко' }
+try {
+    $man = '{"Login":"ivanov","Name":"Иванов <b>И. И.</b>","SourcePC":"PC-OLD","Created":"2026-11-08T10:05:00","Operator":"EX\\adm (окно: EX\\me на ME)",
+      "Items":[{"Key":"Desktop","Title":"Рабочий стол","Status":"ok","Files":12,"Bytes":1048576,"Note":""},
+               {"Key":"Chrome","Title":"Google Chrome","Status":"none","Files":0,"Bytes":0,"Note":"на этом ПК его нет"}],
+      "Restores":[]}' | ConvertFrom-Json
+    $rec = [ordered]@{ PC = 'PC-NEW'; Date = '2026-11-08T11:30:00'; Operator = 'EX\adm'; Status = 'warn'; Items = @(
+        [ordered]@{ Key = 'Dpapi'; Title = 'Ключи DPAPI'; Status = 'ok'; Files = 3; Bytes = 2048; Note = '' }
+        [ordered]@{ Key = 'Desktop'; Title = 'Рабочий стол'; Status = 'warn'; Files = 12; Bytes = 1048576; Note = 'не скопировано 1 файл(ов): файл открыт в программе — 1' }
+        [ordered]@{ Key = 'Yandex'; Title = 'Яндекс Браузер'; Status = 'skip'; Files = 0; Bytes = 0; Note = 'браузер был открыт' }
+    ) }
+    $p = New-Act $man $rec
+    $html = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+    Check 'акт: файл в logs\acts' ((Split-Path (Split-Path $p -Parent) -Leaf) -eq 'acts' -and (Split-Path $p -Leaf) -eq '2026-11-08_1130_ivanov_PC-NEW.html')
+    Check 'акт: HTML экранирован' ($html -like '*Иванов &lt;b&gt;И. И.&lt;/b&gt;*' -and $html -like '*ООО &lt;Ромашка&gt; &amp; Ко*' -and $html -notlike '*<b>И. И.</b>*')
+    Check 'акт: перенос на другой ПК' ($html -like '*переноса данных пользователя на другой компьютер*' -and $html -like '*PC-NEW, данные перенесены 08.11.2026 11:30*')
+    Check 'акт: строки таблицы' (([regex]::Matches($html, '<tr><td class="c">')).Count -eq 3)
+    Check 'акт: замечания и пропуск' ($html -like '*с замечаниями, см. графу*' -and $html -like '*пропущено*' -and $html -like '*файл открыт в программе*')
+    Check 'акт: строки для подписи' ($html -like '*Перенос выполнил*' -and $html -like '*Данные проверил, претензий нет*')
+    $p2 = New-Act $man $null
+    $html2 = [IO.File]::ReadAllText($p2, [Text.Encoding]::UTF8)
+    Check 'акт без развёртывания: о резервной копии' ($html2 -like '*резервного копирования*' -and $html2 -like '*снята полностью*' -and $html2 -notlike '*Google Chrome*')
+    $rec.PC = 'pc-old'
+    $html3 = [IO.File]::ReadAllText((New-Act $man $rec), [Text.Encoding]::UTF8)
+    Check 'акт: тот же ПК = восстановление' ($html3 -like '*восстановления данных*' -and $html3 -like '*Восстановлено:*')
+} finally { Remove-Item -LiteralPath $script:LogDir -Recurse -Force -ErrorAction SilentlyContinue }
 
 # ----------------------------------------------------------------
 
