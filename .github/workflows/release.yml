@@ -1,0 +1,51 @@
+# Релиз: тег v<версия> (например, v1.5) → проверки, ZIP для скачивания и его SHA256 в Releases.
+# Выпустить версию: поднять $script:AppVersion в profile-move.ps1, дописать «Версии» в README.md, затем
+#   git tag v1.5
+#   git push origin v1.5
+# В ZIP не попадает то, что помечено export-ignore в .gitattributes (.github, tests).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checks (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\check.ps1
+
+      - name: Version matches tag
+        shell: powershell
+        run: |
+          $tag = $env:GITHUB_REF_NAME -replace '^v', ''
+          $line = Select-String -LiteralPath .\profile-move.ps1 -Pattern "^\`$script:AppVersion = '([^']+)'" | Select-Object -First 1
+          if (-not $line) { throw 'AppVersion not found in profile-move.ps1' }
+          $ver = $line.Matches[0].Groups[1].Value
+          if ($ver -ne $tag) { throw "Tag v$tag, but profile-move.ps1 has AppVersion $ver" }
+
+      - name: Build ZIP
+        shell: bash
+        run: |
+          name="UserProfileMover-${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          git archive --format=zip --prefix="${name}/" -o "dist/${name}.zip" HEAD
+          cd dist && sha256sum "${name}.zip" > "${name}.zip.sha256" && cat "${name}.zip.sha256"
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "UserProfileMover ${GITHUB_REF_NAME#v}" --generate-notes
+          fi

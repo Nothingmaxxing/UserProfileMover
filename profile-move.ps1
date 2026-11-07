@@ -17,6 +17,7 @@
 # К ПК окно ходит по IP: адреса берёт у DNS контроллера домена (DcIp в config.psd1, если задан), так что работает,
 # даже когда VPN/прокси на ПК администратора подменяет DNS. Что по адресу отвечает нужный ПК, проверяет по имени,
 # которое сообщает сам ПК.
+# Раз в день окно спрашивает GitHub, не вышла ли новая версия (UpdateCheck в config.psd1).
 # https://github.com/Nothingmaxxing/UserProfileMover, лицензия MIT.
 # -NoGui: только загрузить функции без окна (для проверки: . .\profile-move.ps1 -NoGui)
 param([string]$NetUser = '', [switch]$NoGui)
@@ -95,7 +96,10 @@ $script:LogDir = Join-Path $script:Root 'logs'
 New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
 $script:LogFile = Join-Path $script:LogDir ('{0:yyyy-MM-dd}_{1}.log' -f (Get-Date), $env:COMPUTERNAME)
 $script:NetUser = if ($NetUser) { $NetUser } else { '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME }
-$script:Version = 'profile-move 1.4 (08.11.2026)'
+$script:AppVersion = '1.5'   # сравнивается с последним релизом на GitHub (тег v1.5)
+$script:Version = 'profile-move 1.5 (08.11.2026)'
+$script:UpdateLink = $null
+$script:Upd = $null
 $script:AppTitle = 'Перенос профиля'
 $script:Busy = $false
 $script:LogBox = $null
@@ -1993,6 +1997,86 @@ function Show-CopyDetails {
     }
 }
 
+# ---------------------------------------------------------------- новая версия на GitHub
+
+# Номер версии из тега релиза: v1.5, 1.5.1 → [version]
+function ConvertTo-AppVersion([string]$Tag) {
+    if ($Tag -match '\d+\.\d+(\.\d+){0,2}') { try { return [version]$Matches[0] } catch { } }
+    return $null
+}
+
+# Последний релиз на GitHub: раз в день, в фоне (окно не ждёт ответа и работает без интернета).
+# Ответ запоминается в %APPDATA%\profile-move\update.json. UpdateCheck = $false в config.psd1: не спрашивать
+function Start-UpdateCheck {
+    if ($script:Cfg.UpdateCheck -eq $false) { return }
+    $repo = if ($script:Cfg.UpdateRepo) { [string]$script:Cfg.UpdateRepo } else { 'Nothingmaxxing/UserProfileMover' }
+    if ($repo -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') { return }
+    $file = Join-Path $env:APPDATA 'profile-move\update.json'
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    try {
+        if (Test-Path -LiteralPath $file) {
+            $c = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($c.Repo -eq $repo -and $c.Checked -eq $today) { Show-Update $c; return }
+        }
+    } catch { }
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript({
+        param([string]$Url)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.UserAgent = 'UserProfileMover-update-check'
+        $req.Accept = 'application/vnd.github+json'
+        $req.Timeout = 15000
+        $req.ReadWriteTimeout = 15000
+        $resp = $req.GetResponse()
+        try {
+            $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+            $o = $sr.ReadToEnd() | ConvertFrom-Json
+            [pscustomobject]@{ Tag = [string]$o.tag_name; Url = [string]$o.html_url }
+        } finally { $resp.Close() }
+    }).AddArgument(('https://api.github.com/repos/{0}/releases/latest' -f $repo))
+    $script:Upd = @{ Ps = $ps; H = $ps.BeginInvoke(); Repo = $repo; File = $file; Today = $today; T0 = Get-Date }
+    $tm = New-Object Windows.Forms.Timer
+    $tm.Interval = 1000
+    $tm.Add_Tick({ param($s, $e) Complete-UpdateCheck $s })
+    $tm.Start()
+}
+
+function Complete-UpdateCheck($Timer) {
+    $u = $script:Upd
+    if (-not $u) { $Timer.Stop(); return }
+    if (-not $u.H.IsCompleted) {
+        if (((Get-Date) - $u.T0).TotalSeconds -gt 60) { $Timer.Stop(); $Timer.Dispose(); $script:Upd = $null }   # не дождались: в другой раз
+        return
+    }
+    $Timer.Stop(); $Timer.Dispose()
+    $script:Upd = $null
+    $r = $null
+    try { $r = @($u.Ps.EndInvoke($u.H)) | Select-Object -First 1 } catch { }   # нет интернета, GitHub не ответил: молча
+    try { $u.Ps.Dispose() } catch { }
+    $c = [pscustomobject]@{ Repo = $u.Repo; Checked = $u.Today; Tag = ''; Url = '' }
+    if ($r) { $c.Tag = [string]$r.Tag; $c.Url = [string]$r.Url }
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $u.File) -Force | Out-Null
+        [IO.File]::WriteAllText($u.File, (ConvertTo-Json -InputObject $c), (New-Object Text.UTF8Encoding($false)))
+    } catch { }
+    Show-Update $c
+}
+
+# Версия на GitHub новее этой: ссылка справа от кнопок и строка в журнале
+function Show-Update($C) {
+    $v = ConvertTo-AppVersion ([string]$C.Tag)
+    if (-not $v -or $v -le [version]$script:AppVersion) { return }
+    $url = [string]$C.Url
+    if ($url -notmatch '^https://github\.com/') { $url = 'https://github.com/{0}/releases/latest' -f $C.Repo }
+    Write-Log ('Вышла новая версия {0} (у вас {1}): {2}' -f $v, $script:AppVersion, $url) 'warn'
+    if ($script:UpdateLink) {
+        $script:UpdateLink.Text = 'Вышла версия {0}: скачать' -f $v
+        $script:UpdateLink.Tag = $url
+        $script:UpdateLink.Visible = $true
+    }
+}
+
 function Set-Busy([bool]$On) {
     $script:Busy = $On
     foreach ($b in $script:Buttons) { $b.Enabled = -not $On }
@@ -2049,6 +2133,13 @@ try {
         (New-Btn 'Журналы' 85 { Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:LogDir) })
     )
     $top.Controls.AddRange([Windows.Forms.Control[]]$btns)
+    $upd = New-Object Windows.Forms.LinkLabel
+    $upd.AutoSize = $true
+    $upd.Visible = $false
+    $upd.Margin = New-Object Windows.Forms.Padding(12, 9, 3, 3)
+    $upd.Add_LinkClicked({ param($s, $e) try { Start-Process -FilePath ([string]$s.Tag) } catch { } })
+    $script:UpdateLink = $upd
+    $top.Controls.Add($upd)
 
     $info = New-Object Windows.Forms.Label
     $info.Dock = 'Top'; $info.Height = 24; $info.Padding = New-Object Windows.Forms.Padding(8, 4, 8, 0)
@@ -2089,6 +2180,7 @@ try {
             Write-Log ('   окно запущено не на ПК администратора: {0}. Пароль администратора домена введён здесь' -f ($why -join ', ')) 'warn'
         }
         Invoke-Guarded { Clear-Staging; Update-Grid; Invoke-Cleanup }
+        try { Start-UpdateCheck } catch { }
     })
     $form.Add_FormClosing({
         param($s, $e)

@@ -2,6 +2,7 @@
 # Запуск: pwsh -File tests/check.ps1 (PowerShell 7 на Linux или Windows) или в Windows PowerShell 5.1.
 # Код выхода = число проваленных проверок
 $ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch { }   # кириллица в журнале GitHub Actions
 $root = Split-Path $PSScriptRoot -Parent
 $script:Fail = 0
 function Check([string]$Name, $Cond) {
@@ -271,6 +272,22 @@ else {
         Check '7-Zip: ошибка, архива нет' ($res8[0].Status -eq 'err' -and $res8[0].Note -like '*код 2*' -and -not (Test-Path -LiteralPath $bad7))
     } finally { Remove-Item -LiteralPath $zt -Recurse -Force -ErrorAction SilentlyContinue }
 }
+
+# ---------------------------------------------------------------- 9. версия и проверка обновлений
+
+. (Get-Fn 'ConvertTo-AppVersion', 'Show-Update')
+Check 'версия из тега' ((ConvertTo-AppVersion 'v1.5') -eq [version]'1.5' -and (ConvertTo-AppVersion '1.5.1') -eq [version]'1.5.1' -and -not (ConvertTo-AppVersion 'latest'))
+$verLine = @(Select-String -LiteralPath (Join-Path $root 'profile-move.ps1') -Pattern "^\`$script:AppVersion = '([^']+)'")
+$appVer = if ($verLine.Count) { $verLine[0].Matches[0].Groups[1].Value } else { '' }
+Check 'AppVersion в profile-move.ps1' ([bool](ConvertTo-AppVersion $appVer))
+$readme = [IO.File]::ReadAllText((Join-Path $root 'README.md'), [Text.Encoding]::UTF8)
+Check 'README: в «Версиях» первой идёт AppVersion' ($readme -match '## Версии\s+- \*\*([\d.]+)\*\*' -and $Matches[1] -eq $appVer)
+$script:AppVersion = '1.5'
+$script:UpdateLink = [pscustomobject]@{ Text = ''; Tag = ''; Visible = $false }
+Show-Update ([pscustomobject]@{ Repo = 'a/b'; Tag = 'v1.5'; Url = 'https://github.com/a/b/releases/tag/v1.5' })
+Check 'обновление: та же версия, ссылки нет' (-not $script:UpdateLink.Visible)
+Show-Update ([pscustomobject]@{ Repo = 'a/b'; Tag = 'v1.6'; Url = 'http://example.com/x' })
+Check 'обновление: новая версия, ссылка только на GitHub' ($script:UpdateLink.Visible -and $script:UpdateLink.Tag -eq 'https://github.com/a/b/releases/latest' -and $script:UpdateLink.Text -like '*1.6*')
 
 # ----------------------------------------------------------------
 
