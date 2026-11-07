@@ -1,14 +1,15 @@
 ﻿#Requires -Version 5.1
 # Окно «Перенос профиля»: перенос данных сотрудника со старого ПК на новый через хранилище копий (NAS, шара или локальная папка).
-# Запуск: «Перенос профиля.cmd» → start.ps1 спрашивает учётку администратора ПК и запускает это окно так,
+# Запуск: profile-move.cmd → start.ps1 спрашивает учётку администратора ПК и запускает это окно так,
 # что к ПК и сетевому хранилищу оно ходит под ней (как runas /netonly), а на этом ПК работает под вашей учёткой.
-#  - «Снять с ПК»: рабочий стол, документы, загрузки (список папок в config.psd1), профиль Яндекс Браузера,
-#    ключи DPAPI сотрудника, подписи КриптоПро (папка «Директория» и контейнеры из реестра), личные сертификаты
+#  - «Снять с ПК»: рабочий стол, документы, загрузки (список папок в config.psd1), профили браузеров (Яндекс,
+#    Chromium-Gost, Chrome, Edge, Firefox; список в config.psd1), ключи DPAPI сотрудника, подписи КриптоПро
+#    (папка «Директория» и контейнеры из реестра), личные сертификаты
 #    → <StoreRoot>\<логин>\<дата>_<время>_<ПК>.
 #  - «Развернуть на ПК»: то же обратно в профиль сотрудника на новом ПК (сотрудник должен один раз войти туда).
 # На старом ПК ничего не удаляется и не меняется. Для реестра ПК окно на время работы включает службу
-# «Удалённый реестр» и потом возвращает её как было. Пароли и закладки Яндекса переносятся вместе с ключами DPAPI:
-# учётка доменная, SID тот же, поэтому на новом ПК Windows их расшифрует.
+# «Удалённый реестр» и потом возвращает её как было. Пароли и куки браузеров на Chromium переносятся вместе
+# с ключами DPAPI: учётка доменная, SID тот же, поэтому на новом ПК Windows их расшифрует.
 # К ПК окно ходит по IP: адреса берёт у DNS контроллера домена (DcIp в config.psd1, если задан), так что работает,
 # даже когда VPN/прокси на ПК администратора подменяет DNS. Что по адресу отвечает нужный ПК, проверяет по имени,
 # которое сообщает сам ПК.
@@ -21,10 +22,58 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.DirectorySer
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:Root = $PSScriptRoot
-$script:Cfg = Import-PowerShellDataFile -Path (Join-Path $script:Root 'config.psd1')
-if (-not $script:Cfg.Domain) { $script:Cfg.Domain = $env:USERDNSDOMAIN }
-if ($null -eq $script:Cfg.EnableYandex) { $script:Cfg.EnableYandex = $true }
-if ($null -eq $script:Cfg.EnableCryptoPro) { $script:Cfg.EnableCryptoPro = $true }
+
+# Браузеры из config.psd1 с настройками по умолчанию. В config.psd1 до версии 1.4 браузер один: Яндекс из YandexPath
+function Initialize-Browsers($Cfg) {
+    $chDirs = @('Cache', 'Code Cache', 'GPUCache', 'GrShaderCache', 'GraphiteDawnCache', 'ShaderCache',
+        'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'CacheStorage', 'ScriptCache',
+        'Crashpad', 'Crash Reports', 'BrowserMetrics', 'optimization_guide_model_store',
+        'component_crx_cache', 'extensions_crx_cache', 'Safe Browsing', 'SwReporter')
+    $chFiles = @('lockfile', '*.tmp', '*.pma')
+    $chLocks = @('lockfile', 'Default\Network\Cookies')
+    if ($Cfg.ContainsKey('ChromiumExcludeDirs')) { $chDirs = @($Cfg.ChromiumExcludeDirs | Where-Object { $_ }) }
+    if ($Cfg.ContainsKey('ChromiumExcludeFiles')) { $chFiles = @($Cfg.ChromiumExcludeFiles | Where-Object { $_ }) }
+    if ($Cfg.ContainsKey('ChromiumLockFiles')) { $chLocks = @($Cfg.ChromiumLockFiles | Where-Object { $_ }) }
+    $src = @($Cfg.Browsers | Where-Object { $_ })
+    if (-not $Cfg.ContainsKey('Browsers') -and $Cfg.YandexPath) {
+        $src = @(@{ Key = 'Yandex'; Title = 'Яндекс Браузер'; Enabled = ($Cfg.EnableYandex -ne $false); UserData = @($Cfg.YandexPath)
+            ExcludeDirs = $Cfg.YandexExcludeDirs; ExcludeFiles = $Cfg.YandexExcludeFiles; Exe = $Cfg.YandexExe })
+    }
+    $taken = @('Dpapi', 'Crypto', 'CryptoReg', 'CryptoDir', 'CertsMy', 'CertsCrypto') + @($Cfg.Folders | ForEach-Object { [string]$_.Key })
+    $seen = @{}
+    foreach ($b in $src) {
+        $key = [string]$b.Key
+        if ($key -notmatch '^[A-Za-z0-9]+$') { throw ('браузер «{0}»: Key должен быть из латинских букв и цифр, а он «{1}»' -f $b.Title, $key) }
+        if ($taken -contains $key -or $seen.ContainsKey($key)) { throw ('браузер «{0}»: Key «{1}» уже занят папкой, подписями или другим браузером' -f $b.Title, $key) }
+        $seen[$key] = $true
+        if ($b.Enabled -eq $false) { continue }
+        $ud = @($b.UserData | Where-Object { $_ })
+        if (-not $ud.Count) { throw ('браузер «{0}»: не указан UserData' -f $b.Title) }
+        [pscustomobject]@{
+            Key          = $key
+            Title        = $(if ($b.Title) { [string]$b.Title } else { $key })
+            UserData     = $ud
+            Dpapi        = ($b.Dpapi -ne $false)
+            LockFiles    = $(if ($b.ContainsKey('LockFiles')) { @($b.LockFiles | Where-Object { $_ }) } else { $chLocks })
+            ExcludeDirs  = $(if ($b.ContainsKey('ExcludeDirs')) { @($b.ExcludeDirs | Where-Object { $_ }) } else { $chDirs })
+            ExcludeFiles = $(if ($b.ContainsKey('ExcludeFiles')) { @($b.ExcludeFiles | Where-Object { $_ }) } else { $chFiles })
+            Exe          = @($b.Exe | Where-Object { $_ })
+            Note         = [string]$b.Note
+        }
+    }
+}
+
+# Ошибку в config.psd1 показываем окном: этот скрипт запускается без консоли
+try {
+    $script:Cfg = Import-PowerShellDataFile -Path (Join-Path $script:Root 'config.psd1')
+    if (-not $script:Cfg.Domain) { $script:Cfg.Domain = $env:USERDNSDOMAIN }
+    if ($null -eq $script:Cfg.EnableCryptoPro) { $script:Cfg.EnableCryptoPro = $true }
+    $script:Browsers = @(Initialize-Browsers $script:Cfg)
+} catch {
+    if ($NoGui) { throw }
+    [void][System.Windows.Forms.MessageBox]::Show(('Ошибка в config.psd1: {0}' -f $_.Exception.Message), 'Перенос профиля', 'OK', 'Error')
+    exit 1
+}
 $script:LogDir = Join-Path $script:Root 'logs'
 New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
 $script:LogFile = Join-Path $script:LogDir ('{0:yyyy-MM-dd}_{1}.log' -f (Get-Date), $env:COMPUTERNAME)
@@ -55,6 +104,7 @@ $script:Titles = [ordered]@{
     CertsCrypto = 'Ключи Windows к сертификатам'
 }
 foreach ($f in $script:Cfg.Folders) { $script:Titles[[string]$f.Key] = [string]$f.Title }
+foreach ($b in $script:Browsers) { $script:Titles[$b.Key] = $b.Title }
 # Галочки в окнах: группа «Подписи» = все части КриптоПро и сертификатов
 $script:CryptoKeys = @('CryptoReg', 'CryptoDir', 'CertsMy', 'CertsCrypto')
 
@@ -740,7 +790,8 @@ function Invoke-Robo([string]$Src, [string]$Dst, [string]$Title, [string]$LogPat
 }
 
 function New-ItemResult([string]$Key, [string]$Status, [string]$Note = '', $Robo = $null) {
-    $o = [ordered]@{ Key = $Key; Title = $script:Titles[$Key]; Status = $Status; Files = 0; Copied = 0; Skipped = 0; Failed = 0; Bytes = 0; Note = $Note }
+    # Src: откуда в профиле сняли (у браузеров, чтобы развернуть туда же)
+    $o = [ordered]@{ Key = $Key; Title = $script:Titles[$Key]; Status = $Status; Files = 0; Copied = 0; Skipped = 0; Failed = 0; Bytes = 0; Note = $Note; Src = '' }
     if ($Robo) { $o.Files = $Robo.Files; $o.Copied = $Robo.Copied; $o.Skipped = $Robo.Skipped; $o.Failed = $Robo.Failed; $o.Bytes = $Robo.Bytes }
     return $o
 }
@@ -899,17 +950,57 @@ function Invoke-Cleanup {
 
 # ---------------------------------------------------------------- Снять с ПК
 
-function Wait-YandexClosed([string]$UserData, [string]$PcName) {
-    while (Test-YandexRunning $UserData) {
-        $a = Show-Msg ('У сотрудника на {0} открыт Яндекс Браузер. Пока он открыт, профиль браузера не скопировать.{1}{1}Попросите закрыть браузер и нажмите «Повторить». «Отмена»: перенести всё остальное без браузера.' -f $PcName, "`r`n") 'Warning' 'RetryCancel'
+function Wait-BrowserClosed($B, [string]$UserData, [string]$PcName) {
+    while (Test-BrowserRunning $B $UserData) {
+        $a = Show-Msg ('У сотрудника на {0} открыт {1}. Пока он открыт, профиль браузера не скопировать.{2}{2}Попросите закрыть браузер и нажмите «Повторить». «Отмена»: перенести всё остальное без этого браузера.' -f $PcName, $B.Title, "`r`n") 'Warning' 'RetryCancel'
         if ($a -ne 'Retry') { return $false }
     }
     return $true
 }
 
-function Test-YandexRunning([string]$UserData) {
+# Браузер открыт, если занят хотя бы один из его LockFiles (путь внутри UserData, можно с * и ?)
+function Test-BrowserRunning($B, [string]$UserData) {
     if (-not (Test-Path -LiteralPath $UserData)) { return $false }
-    return ((Test-Locked (Join-Path $UserData 'lockfile') -Write) -or (Test-Locked (Join-Path $UserData 'Default\Network\Cookies') -Write))
+    foreach ($lf in $B.LockFiles) {
+        $paths = if ($lf -match '[*?]') { @(Get-ChildItem -Path (Join-Path $UserData $lf) -File -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) } else { @(Join-Path $UserData $lf) }
+        foreach ($p in $paths) { if (Test-Locked $p -Write) { return $true } }
+    }
+    return $false
+}
+
+# Ключи robocopy /XD и /XF; пустые списки не передаём
+function Get-ExcludeArgs($Dirs, $Files) {
+    $d = @($Dirs | Where-Object { $_ })
+    $f = @($Files | Where-Object { $_ })
+    if ($d.Count) { '/XD'; $d }
+    if ($f.Count) { '/XF'; $f }
+}
+
+# Браузеры из галочек, профиль которых можно копировать: Rel = путь UserData внутри профиля, Ud = он же на ПК.
+# $Manifest: при развёртывании берём путь, с которого сняли; $null: при снятии ищем первый существующий UserData.
+# Пропущенные (нет на ПК, открыт) записываются в $Results
+function Get-BrowserJobs($Prof, $Pc, [string[]]$Groups, $Manifest, $Results) {
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($b in @($script:Browsers | Where-Object { $Groups -contains $_.Key })) {
+        $rel = $null
+        if ($Manifest) {
+            if (-not (Get-CopyHas $Manifest $b.Key)) { continue }
+            $it = @($Manifest.Items) | Where-Object { $_.Key -eq $b.Key } | Select-Object -First 1
+            $rel = [string]$it.Src
+            if (-not $rel) { $rel = $b.UserData[0] }   # копии до версии 1.4
+        } else {
+            foreach ($c in $b.UserData) { if (Test-Path -LiteralPath (Join-Path $Prof.Unc $c)) { $rel = $c; break } }
+            if (-not $rel) { $r = New-ItemResult $b.Key 'none' 'на этом ПК его нет'; $Results.Add($r); Write-ItemLog $r; continue }
+        }
+        $ud = Join-Path $Prof.Unc $rel
+        if (-not (Wait-BrowserClosed $b $ud $Pc.Name)) {
+            $Results.Add((New-ItemResult $b.Key 'skip' 'браузер был открыт'))
+            Write-Log ('   {0} пропущен: открыт у сотрудника' -f $b.Title) 'warn'
+            continue
+        }
+        $jobs.Add([pscustomobject]@{ B = $b; Rel = $rel; Ud = $ud })
+    }
+    return , $jobs
 }
 
 function Get-LongPathText {
@@ -949,13 +1040,7 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups) {
             Write-Log '   сотрудник в Windows: открытые файлы могут не скопироваться' 'warn'
         }
 
-        $doYandex = $Groups -contains 'Yandex'
-        $ud = Join-Path $prof.Unc $script:Cfg.YandexPath
-        if ($doYandex -and -not (Wait-YandexClosed $ud $pc.Name)) {
-            $doYandex = $false
-            $results.Add((New-ItemResult 'Yandex' 'skip' 'браузер был открыт'))
-            Write-Log '   Яндекс Браузер пропущен: открыт у сотрудника' 'warn'
-        }
+        $bJobs = Get-BrowserJobs $prof $pc $Groups $null $results
 
         $dir = Join-Path (Join-Path $script:Cfg.StoreRoot $user.Login) ('{0}_{1}' -f (Get-Stamp), $pc.Name)
         $logs = Join-Path $dir '_logs'
@@ -969,14 +1054,14 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups) {
         Save-Manifest $dir $m
         Write-Log ('   копия: {0}' -f $dir)
 
-        $fx = @('/XF') + @($script:Cfg.FileExcludes)
+        $fx = @(Get-ExcludeArgs @() $script:Cfg.FileExcludes)
         $base = @('/E', '/COPY:DAT', '/DCOPY:T')
-        if ($doYandex) {
-            $x = $base + @('/XD') + @($script:Cfg.YandexExcludeDirs) + @('/XF') + @($script:Cfg.YandexExcludeFiles)
-            [void](Invoke-RoboItem 'Yandex' $ud (Join-Path $dir 'Yandex') $logs $x $results)
+        foreach ($j in $bJobs) {
+            $r = Invoke-RoboItem $j.B.Key $j.Ud (Join-Path $dir $j.B.Key) $logs ($base + @(Get-ExcludeArgs $j.B.ExcludeDirs $j.B.ExcludeFiles)) $results
+            $r.Src = $j.Rel
         }
         $doCrypto = $Groups -contains 'Crypto'
-        if ($doYandex -or $doCrypto) {
+        if ($doCrypto -or @($bJobs | Where-Object { $_.B.Dpapi }).Count) {
             $dp = Join-Path $prof.Unc ($script:Cfg.DpapiPath -replace '\{SID\}', $user.Sid)
             [void](Invoke-RoboItem 'Dpapi' $dp (Join-Path $dir 'DPAPI') $logs @('/E', '/COPY:DAT') $results)
         }
@@ -1059,14 +1144,8 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
         }
         Write-Log ('   на диске {0}: свободно {1}, переносим {2}' -f $drive, (Format-Size $freeT), (Format-Size $need))
 
-        $doYandex = ($Groups -contains 'Yandex') -and (Get-CopyHas $m 'Yandex')
         $doCrypto = ($Groups -contains 'Crypto')
-        $ud = Join-Path $prof.Unc $script:Cfg.YandexPath
-        if ($doYandex -and -not (Wait-YandexClosed $ud $pc.Name)) {
-            $doYandex = $false
-            $results.Add((New-ItemResult 'Yandex' 'skip' 'браузер был открыт'))
-            Write-Log '   Яндекс Браузер пропущен: открыт у сотрудника' 'warn'
-        }
+        $bJobs = Get-BrowserJobs $prof $pc $Groups $m $results
 
         $logs = Join-Path $src ('_logs\restore_{0}_{1}' -f $stamp, $pc.Name)
         New-Item -ItemType Directory -Path $logs -Force | Out-Null
@@ -1074,7 +1153,7 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
         $keep = @('/XC', '/XN', '/XO')
 
         # 1. Ключи DPAPI: только новые файлы, Preferred нового ПК не трогаем
-        if (($doYandex -or $doCrypto) -and (Get-CopyHas $m 'Dpapi')) {
+        if (($doCrypto -or @($bJobs | Where-Object { $_.B.Dpapi }).Count) -and (Get-CopyHas $m 'Dpapi')) {
             $dp = Join-Path $prof.Unc ($script:Cfg.DpapiPath -replace '\{SID\}', $user.Sid)
             [void](Invoke-RoboItem 'Dpapi' (Join-Path $src 'DPAPI') $dp $logs (@('/E', '/COPY:DAT', '/XF', 'Preferred') + $keep) $results)
         }
@@ -1102,32 +1181,36 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
                 Write-Log ('   на {0} не найден КриптоПро CSP ({1}): контейнеры на месте, но без КриптоПро и его лицензии подпись не заработает' -f $pc.Name, $script:Cfg.CryptoProPc) 'warn'
             }
         }
-        # 3. Яндекс Браузер: старый профиль нового ПК (если был) в сторону, на его место профиль из копии
-        if ($doYandex) {
+        # 3. Браузеры: прежний профиль нового ПК (если был) в сторону, на его место профиль из копии
+        foreach ($j in $bJobs) {
+            $b = $j.B; $ud = $j.Ud
             $moved = ''
             $ok = $true
             if (Test-Path -LiteralPath $ud) {
-                $bakName = 'User Data.old-' + $stamp
+                $bakName = (Split-Path $ud -Leaf) + '.old-' + $stamp
                 try { Rename-Item -LiteralPath $ud -NewName $bakName; $moved = $bakName }
                 catch {
                     $ok = $false
-                    $r = New-ItemResult 'Yandex' 'err' ('не удалось убрать в сторону профиль браузера на новом ПК (занят?): ' + $_.Exception.Message)
+                    $r = New-ItemResult $b.Key 'err' ('не удалось убрать в сторону прежний профиль браузера на новом ПК (занят?): ' + $_.Exception.Message)
                     $results.Add($r); Write-ItemLog $r
                 }
             }
             if ($ok) {
-                $r = Invoke-RoboItem 'Yandex' (Join-Path $src 'Yandex') $ud $logs $base $results
+                $r = Invoke-RoboItem $b.Key (Join-Path $src $b.Key) $ud $logs $base $results
+                $r.Src = $j.Rel
                 if ($moved) { $r.Note = (($r.Note, ('прежний профиль браузера нового ПК лежит рядом: ' + $moved)) | Where-Object { $_ }) -join '; '; Write-Log ('      прежний профиль браузера на ПК переименован в «{0}»' -f $moved) }
             }
-            $exe = $false
-            foreach ($e in $script:Cfg.YandexExe) {
-                $p = if ($e -match '^[A-Za-z]:\\') { ConvertTo-Unc $pc.Host $e } else { Join-Path $prof.Unc $e }
-                if (Test-Path -LiteralPath $p) { $exe = $true; break }
+            if ($b.Exe.Count) {
+                $exe = $false
+                foreach ($e in $b.Exe) {
+                    $p = if ($e -match '^[A-Za-z]:\\') { ConvertTo-Unc $pc.Host $e } else { Join-Path $prof.Unc $e }
+                    if (Test-Path -LiteralPath $p) { $exe = $true; break }
+                }
+                if (-not $exe) { Write-Log ('   на {0} не найден {1}: установите его, профиль уже на месте' -f $pc.Name, $b.Title) 'warn' }
             }
-            if (-not $exe) { Write-Log ('   на {0} не найден Яндекс Браузер: установите его, профиль уже на месте' -f $pc.Name) 'warn' }
         }
         # 4. Папки: файлы, которые на новом ПК новее, не перезаписываем
-        $fx = @('/XF') + @($script:Cfg.FileExcludes)
+        $fx = @(Get-ExcludeArgs @() $script:Cfg.FileExcludes)
         foreach ($f in $script:Cfg.Folders) {
             if ($Groups -notcontains $f.Key -or -not (Get-CopyHas $m $f.Key)) { continue }
             [void](Invoke-RoboItem $f.Key (Join-Path $src $f.Key) (Join-Path $prof.Unc $f.Path) $logs ($base + @('/XO') + $fx) $results)
@@ -1157,13 +1240,18 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
     $checks = New-Object System.Collections.Generic.List[string]
     $fl = @($script:Cfg.Folders | Where-Object { $done.ContainsKey($_.Key) } | ForEach-Object { $_.Title })
     if ($fl.Count) { $checks.Add(($fl -join ', ') + ': файлы на месте.') }
-    if ($done.ContainsKey('Yandex')) { $checks.Add('Яндекс Браузер: закладки и вкладки на месте; Настройки → Пароли: пароли открываются (Windows спросит пароль сотрудника). Если браузер был открыт во время переноса, закрыть и открыть.') }
+    $doneB = @($script:Browsers | Where-Object { $done.ContainsKey($_.Key) })
+    foreach ($b in $doneB) {
+        $t = '{0}: закладки и вкладки на месте, сохранённые пароли открываются (при просмотре Windows может спросить пароль сотрудника).' -f $b.Title
+        if ($b.Note) { $t += ' ' + $b.Note }
+        $checks.Add($t)
+    }
     if ($done.ContainsKey('CryptoReg') -or $done.ContainsKey('CryptoDir') -or $done.ContainsKey('CertsMy')) { $checks.Add('КриптоПро: Инструменты КриптоПро → Контейнеры: подписи видны, сертификат открывается. Лицензия КриптоПро на новом ПК своя.') }
     if ($checks.Count) {
         $txt += 'Проверить с сотрудником:' + $n
         for ($j = 0; $j -lt $checks.Count; $j++) { $txt += ('{0}. {1}' -f ($j + 1), $checks[$j]) + $n }
     }
-    if ($done.ContainsKey('Yandex')) { $txt += $n + ('Если пароли не открылись: экспорт паролей в CSV на старом ПК и импорт на новом. Копия хранится {0} дней.' -f $script:Cfg.RetentionDays) }
+    if ($doneB.Count) { $txt += $n + ('Если пароли не открылись: экспорт паролей в CSV на старом ПК и импорт на новом. Если браузер был открыт во время переноса, закрыть и открыть. Копия хранится {0} дней.' -f $script:Cfg.RetentionDays) }
     [void](Show-Msg $txt $(if ($st -eq 'ok') { 'Information' } else { 'Warning' }))
 }
 
@@ -1210,12 +1298,12 @@ function Add-DialogButtons($F, [string]$OkText, [int]$Y) {
     return $ok
 }
 
-# Галочки «что переносить»: папки из config.psd1, затем Яндекс и подписи (если включены).
+# Галочки «что переносить»: папки и браузеры из config.psd1, затем подписи (если включены).
 # Checks: Key → CheckBox по порядку; Bottom: Y под последней галочкой
 function Add-GroupChecks($F, [int]$Y) {
     $checks = [ordered]@{}
     foreach ($fd in $script:Cfg.Folders) { $checks[[string]$fd.Key] = New-Check $F ([string]$fd.Title) 24 $Y; $Y += 22 }
-    if ($script:Cfg.EnableYandex) { $checks['Yandex'] = New-Check $F 'Яндекс Браузер: закладки, пароли, вкладки' 24 $Y; $Y += 22 }
+    foreach ($b in $script:Browsers) { $checks[$b.Key] = New-Check $F ('{0}: закладки, пароли, вкладки' -f $b.Title) 24 $Y; $Y += 22 }
     if ($script:Cfg.EnableCryptoPro) { $checks['Crypto'] = New-Check $F 'Подписи КриптоПро и личные сертификаты' 24 $Y; $Y += 22 }
     return [pscustomobject]@{ Checks = $checks; Bottom = $Y }
 }
