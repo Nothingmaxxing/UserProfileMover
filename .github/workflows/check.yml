@@ -1,0 +1,32 @@
+# Проверки tests/check.ps1: в Windows PowerShell 5.1 (как у пользователей, с настоящим 7-Zip из образа)
+# и в PowerShell 7 на Linux
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\tests\check.ps1
+
+      - name: PowerShell 7
+        if: runner.os != 'Windows'
+        shell: pwsh
+        run: ./tests/check.ps1

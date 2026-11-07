@@ -1,2 +1,7 @@
 # Windows-проект: в репозитории LF, на диске CRLF (PowerShell 5.1 и .cmd)
 * text=auto eol=crlf
+# Не в ZIP релиза (git archive): служебное и проверки
+.github export-ignore
+tests export-ignore
+.gitattributes export-ignore
+.gitignore export-ignore
