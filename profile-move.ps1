@@ -9,6 +9,8 @@
 #  - «Развернуть на ПК»: то же обратно в профиль сотрудника на новом ПК (сотрудник должен один раз войти туда).
 #  - «Перенести сразу»: оба шага подряд, когда старый и новый ПК включены.
 #  - «Акт»: акт переноса для печати и подписи (HTML), после развёртывания окно предлагает открыть его само.
+# Копию можно зашифровать паролем (7-Zip, AES-256): тогда она собирается во временной папке на этом ПК,
+# а в хранилище уходит только архив.
 # На старом ПК ничего не удаляется и не меняется. Для реестра ПК окно на время работы включает службу
 # «Удалённый реестр» и потом возвращает её как было. Пароли и куки браузеров на Chromium переносятся вместе
 # с ключами DPAPI: учётка доменная, SID тот же, поэтому на новом ПК Windows их расшифрует.
@@ -65,12 +67,24 @@ function Initialize-Browsers($Cfg) {
     }
 }
 
+# 7-Zip: путь из config.psd1 (SevenZip) или из стандартных мест установки. Пусто: не найден
+function Find-7z($Cfg) {
+    $c = @([string]$Cfg.SevenZip)
+    foreach ($pf in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($pf) { $c += Join-Path $pf '7-Zip\7z.exe' } }
+    foreach ($p in $c) { if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { return $p } }
+    return ''
+}
+
 # Ошибку в config.psd1 показываем окном: этот скрипт запускается без консоли
 try {
     $script:Cfg = Import-PowerShellDataFile -Path (Join-Path $script:Root 'config.psd1')
     if (-not $script:Cfg.Domain) { $script:Cfg.Domain = $env:USERDNSDOMAIN }
     if ($null -eq $script:Cfg.EnableCryptoPro) { $script:Cfg.EnableCryptoPro = $true }
     if ($null -eq $script:Cfg.Act) { $script:Cfg.Act = $true }
+    if (-not $script:Cfg.Encrypt) { $script:Cfg.Encrypt = 'Optional' }
+    if (@('Off', 'Optional', 'On', 'Required') -notcontains $script:Cfg.Encrypt) { throw ('Encrypt = «{0}», а можно Off, Optional, On или Required' -f $script:Cfg.Encrypt) }
+    $script:SevenZip = Find-7z $script:Cfg
+    $script:Staging = if ($script:Cfg.StagingDir) { [string]$script:Cfg.StagingDir } else { Join-Path $env:TEMP 'profile-move' }
     $script:Browsers = @(Initialize-Browsers $script:Cfg)
 } catch {
     if ($NoGui) { throw }
@@ -97,6 +111,9 @@ $script:AdPath = $null      # путь LDAP, через который AD отв
 $script:AdRoots = @{}
 $script:ProgressLogSec = 30   # как часто строка с процентом пишется в журнал (в заголовке окна процент каждые 2 с)
 $script:LongPaths = New-Object System.Collections.Generic.List[string]   # не скопированные из-за длинного пути, за одну операцию
+$script:SpaceGuard = $null   # временная папка шифрования: перед каждой частью проверяем, хватит ли на её диске места
+$script:Aborting = $false    # окно закрывают во время работы: остановить robocopy и 7-Zip
+$script:InCleanup = $false   # стираем временную папку: это не останавливать
 
 $script:Titles = [ordered]@{
     Yandex      = 'Яндекс Браузер'
@@ -105,6 +122,7 @@ $script:Titles = [ordered]@{
     CryptoDir   = 'КриптоПро: папка «Директория»'
     CertsMy     = 'Личные сертификаты'
     CertsCrypto = 'Ключи Windows к сертификатам'
+    Archive     = 'Шифрование (7-Zip, AES-256)'
 }
 foreach ($f in $script:Cfg.Folders) { $script:Titles[[string]$f.Key] = [string]$f.Title }
 foreach ($b in $script:Browsers) { $script:Titles[$b.Key] = $b.Title }
@@ -723,6 +741,11 @@ function Format-Percent($St, [long]$TotalBytes, [long]$TotalFiles) {
     return ('{0}% ({1} из {2}, файлов {3} из {4})' -f $pct, (Format-Size $St.Bytes), (Format-Size $TotalBytes), [Math]::Min($St.Files, $TotalFiles), $TotalFiles)
 }
 
+function Stop-Child($P) {
+    try { if (-not $P.HasExited) { $P.Kill(); [void]$P.WaitForExit(5000) } } catch { }
+    try { $P.Dispose() } catch { }
+}
+
 # robocopy без окна; окно программы при этом не замирает. $OnTick вызывается примерно раз в 2 с
 function Start-RoboWait([string[]]$RoboArgs, [scriptblock]$OnTick) {
     $psi = New-Object Diagnostics.ProcessStartInfo
@@ -735,6 +758,7 @@ function Start-RoboWait([string[]]$RoboArgs, [scriptblock]$OnTick) {
     while (-not $p.HasExited) {
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 150
+        if ($script:Aborting -and -not $script:InCleanup) { Stop-Child $p; throw 'Прервано: окно закрыли' }
         if ($OnTick -and ((Get-Date) - $tick).TotalSeconds -ge 2) { & $OnTick; $tick = Get-Date }
     }
     $p.WaitForExit()
@@ -767,6 +791,13 @@ function Invoke-Robo([string]$Src, [string]$Dst, [string]$Title, [string]$LogPat
         $plan = Read-RoboLog $planLog
         try { Remove-Item -LiteralPath $planLog -Force } catch { }
         $totB = [long]$plan.BytesCopied; $totF = [long]$plan.Copied
+        # Временная папка шифрования на этом ПК: хватит ли места (место в хранилище проверено в начале)
+        if ($script:SpaceGuard -and $totB -gt 0) {
+            $freeG = [PmDisk]::Free($script:SpaceGuard)
+            if ($freeG -lt $totB + 512MB) {
+                throw ('Во временной папке {0} свободно {1}, а «{2}» занимает {3}. Освободите место на этом диске или укажите в config.psd1 StagingDir на другом диске' -f $script:SpaceGuard, (Format-Size $freeG), $Title, (Format-Size $totB))
+            }
+        }
 
         # 2. Копирование
         $st = [pscustomobject]@{ Log = $LogPath; Pos = 0L; Bytes = 0L; Files = 0L }
@@ -856,12 +887,176 @@ function Get-Worst($Items) {
 function Remove-LongDir([string]$Path) {
     $empty = Join-Path $env:TEMP ('pm-empty-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $empty | Out-Null
+    $was = $script:InCleanup
+    $script:InCleanup = $true
     try {
         $log = Join-Path $env:TEMP ('pm-purge-' + [guid]::NewGuid().ToString('N') + '.log')
         [void](Invoke-Robo $empty $Path 'удаление' $log @('/MIR'))
         Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $Path -Recurse -Force
-    } finally { Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue }
+    } finally {
+        $script:InCleanup = $was
+        Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------- шифрование: 7-Zip и временная папка
+
+# Временная папка <StagingDir>\pm-<PID окна>-<дата>-<логин>. По PID окно при запуске находит папки, оставшиеся
+# от окон, которые уже закрыты (в них данные сотрудника без шифрования), и стирает их
+function New-Staging([string]$Tag) {
+    $d = Join-Path $script:Staging ('pm-{0}-{1}-{2}' -f $PID, (Get-Stamp), $Tag)
+    if (Test-Path -LiteralPath $d) { $d += '-' + [guid]::NewGuid().ToString('N').Substring(0, 6) }
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    return $d
+}
+
+function Remove-Staging([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return }
+    try { Remove-LongDir $Dir; Write-Log ('   временная папка {0} стёрта' -f $Dir) }
+    catch { Write-Log ('   временная папка {0} не стёрлась: {1}. Сотрите её вручную: в ней данные сотрудника без шифрования' -f $Dir, $_.Exception.Message) 'warn' }
+}
+
+# Временные папки от закрытых окон (-Own: от этого окна) стереть
+function Clear-Staging([switch]$Own) {
+    if (-not $script:Staging -or -not (Test-Path -LiteralPath $script:Staging)) { return }
+    foreach ($d in @(Get-ChildItem -LiteralPath $script:Staging -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -notmatch '^pm-(\d+)-') { continue }
+        $id = [int]$Matches[1]
+        if ($Own) { if ($id -ne $PID) { continue } }
+        else {
+            $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+            if ($p -and $p.ProcessName -match 'powershell') { continue }   # то окно ещё открыто
+            Write-Log ('   осталась временная папка от прошлого запуска (окно закрыли во время работы): {0}' -f $d.FullName) 'warn'
+        }
+        Remove-Staging $d.FullName
+    }
+}
+
+# Пароль копии: латиница, цифры, знаки, пробел внутри (ASCII), от 8 знаков. Русские буквы нельзя: 7-Zip читает
+# пароль в кодировке консоли, и на другом ПК тот же пароль мог бы дать другой ключ
+function Test-CopyPassword([string]$P) {
+    if ($P.Length -lt 8) { return 'Пароль: не короче 8 знаков.' }
+    if ($P -cnotmatch '^[\x21-\x7E][\x20-\x7E]*[\x21-\x7E]$') { return 'Пароль: только латинские буквы, цифры и знаки, без русских букв и без пробелов в начале и в конце.' }
+    return ''
+}
+
+# Главное из вывода 7-Zip для сообщения: строки с ошибкой, иначе последние
+function Get-7zMessage([string]$Text) {
+    $l = @($Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^(Enter|Verify) password' })
+    $e = @($l | Where-Object { $_ -match '(?i)error|warning|cannot|can not|wrong|denied|space' })
+    $t = (@($(if ($e.Count) { $e } else { $l })) | Select-Object -Last 3) -join ' '
+    if ($t.Length -gt 300) { $t = $t.Substring(0, 300) + '…' }
+    return $t
+}
+
+# 7-Zip без окна. Пароль идёт через stdin (дважды: при создании архива 7-Zip может переспросить, лишняя строка
+# не мешает), в командной строке его нет: её видят другие программы на ПК. Вывод в UTF-8 (-sccUTF-8),
+# процент (-bsp1) в заголовке окна и раз в 30 с в журнале
+function Invoke-7z([string[]]$ZArgs, [string]$Password, [string]$Title) {
+    # Если кодировка консоли UTF-8 с BOM, Process пишет BOM в начало stdin, и 7-Zip счёл бы его частью пароля
+    try { if ([Console]::InputEncoding.GetPreamble().Length) { [Console]::InputEncoding = New-Object Text.UTF8Encoding($false) } } catch { }
+    if ([Console]::InputEncoding.GetPreamble().Length) { throw 'Пароль не передать в 7-Zip: кодировка консоли UTF-8 с BOM (бета-режим UTF-8 в Windows)' }
+    $all = @($ZArgs[0]) + @('-sccUTF-8', '-bsp1', '-bso1', '-bse1', '-y') + @($ZArgs | Select-Object -Skip 1)
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:SevenZip
+    $psi.Arguments = (@($all | ForEach-Object { Format-Arg $_ }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = New-Object Text.UTF8Encoding($false)
+    $psi.StandardErrorEncoding = New-Object Text.UTF8Encoding($false)
+    $form = $script:MainForm
+    $title0 = if ($form) { $form.Text } else { '' }
+    $out = New-Object Text.StringBuilder
+    $t0 = Get-Date; $tick = $t0; $next = $script:ProgressLogSec; $pct = -1
+    $p = [Diagnostics.Process]::Start($psi)
+    try {
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $pw = [Text.Encoding]::ASCII.GetBytes($Password + "`n")
+        try {
+            for ($i = 0; $i -lt 2; $i++) { $p.StandardInput.BaseStream.Write($pw, 0, $pw.Length) }
+            $p.StandardInput.BaseStream.Flush()
+        } catch { }   # 7-Zip уже вышел (ошибка в аргументах): причину покажет его вывод
+        try { $p.StandardInput.Close() } catch { }
+        $buf = New-Object char[] 8192
+        $rd = $p.StandardOutput.ReadAsync($buf, 0, $buf.Length)
+        while ($true) {
+            if ($rd.IsCompleted) {
+                $cnt = $rd.Result
+                if ($cnt -le 0) { break }
+                $chunk = New-Object string($buf, 0, $cnt)
+                [void]$out.Append($chunk)
+                $ms = [regex]::Matches($chunk, '(\d{1,3})%')
+                if ($ms.Count) { $pct = [int]$ms[$ms.Count - 1].Groups[1].Value }
+                $rd = $p.StandardOutput.ReadAsync($buf, 0, $buf.Length)
+                continue
+            }
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 150
+            if ($script:Aborting) { Stop-Child $p; $p = $null; throw 'Прервано: окно закрыли' }
+            if (((Get-Date) - $tick).TotalSeconds -ge 2) {
+                $tick = Get-Date
+                $pt = if ($pct -ge 0) { '{0}%' -f $pct } else { '…' }
+                if ($form) { $form.Text = ('{0}: {1} {2}' -f $script:AppTitle, $Title, $pt) }
+                $el = (Get-Date) - $t0
+                if ($el.TotalSeconds -ge $next) { Write-Log ('   … {0}: {1}, прошло {2}' -f $Title, $pt, (Format-Span $el)); $next += $script:ProgressLogSec }
+            }
+        }
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        [void]$out.Append($errTask.Result)
+    } finally {
+        if ($form) { $form.Text = $title0 }
+        if ($p) { $p.Dispose() }
+    }
+    # Строки процента 7-Zip затирает символами \b: в итоговом выводе они не нужны
+    $text = @(($out.ToString() -replace '[\b]+', "`n") -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^\d{1,3}%' }) -join "`r`n"
+    return [pscustomobject]@{ Code = $code; Output = $text; Time = ((Get-Date) - $t0) }
+}
+
+# Сжать и зашифровать собранную копию в архив хранилища (имена файлов тоже шифруются: -mhe=on).
+# Итог строкой «Шифрование» в $Results, возвращает размер архива
+function Compress-Copy([string]$DataDir, [string]$Archive, [string]$Password, $Results) {
+    Write-Log ('   шифрую копию в {0}' -f $Archive)
+    $z = Invoke-7z @('a', '-t7z', '-mx=1', '-mmt=on', '-mhe=on', '-p', '--', $Archive, (Join-Path $DataDir '*')) $Password 'шифрование'
+    $size = 0L
+    try { $size = [long](Get-Item -LiteralPath $Archive -ErrorAction Stop).Length } catch { }
+    if ($z.Code -ge 2) {
+        try { Remove-Item -LiteralPath $Archive -Force -ErrorAction Stop } catch { }
+        $size = 0L
+        $r = New-ItemResult 'Archive' 'err' ('7-Zip не создал архив (код {0}): {1}' -f $z.Code, (Get-7zMessage $z.Output))
+    } elseif ($z.Code -eq 1) {
+        $r = New-ItemResult 'Archive' 'warn' ('архив {0}; 7-Zip предупредил: {1}' -f (Format-Size $size), (Get-7zMessage $z.Output))
+    } else {
+        $r = New-ItemResult 'Archive' 'ok' ('архив {0}, за {1}' -f (Format-Size $size), (Format-Span $z.Time))
+    }
+    $Results.Add($r); Write-ItemLog $r
+    return $size
+}
+
+# Проверить пароль копии: у архива зашифрованы и имена файлов, без пароля 7-Zip не прочитает даже список.
+# Пусто: пароль подошёл, иначе текст ошибки
+function Test-ArchivePassword([string]$Archive, [string]$Password) {
+    if (-not (Test-Path -LiteralPath $Archive)) { return ('В копии нет архива {0}: копия неполная.' -f $Archive) }
+    $z = Invoke-7z @('l', '--', $Archive) $Password 'проверка пароля'
+    if ($z.Code -eq 0) { return '' }
+    if ($z.Output -match '(?i)wrong password|encrypted archive') { return 'Неверный пароль копии.' }
+    return ('7-Zip не открыл архив копии (код {0}): {1}' -f $z.Code, (Get-7zMessage $z.Output))
+}
+
+function Expand-Copy([string]$Archive, [string]$DataDir, [string]$Password) {
+    if (-not (Test-Path -LiteralPath $Archive)) { throw ('В копии нет архива {0}: копия неполная' -f $Archive) }
+    Write-Log ('   расшифровываю копию во временную папку {0}' -f $DataDir)
+    $z = Invoke-7z @('x', ('-o' + $DataDir), '--', $Archive) $Password 'расшифровка'
+    if ($z.Code -ge 2) {
+        if ($z.Output -match '(?i)wrong password') { throw 'Неверный пароль копии' }
+        throw ('7-Zip не распаковал копию (код {0}): {1}' -f $z.Code, (Get-7zMessage $z.Output))
+    }
+    if ($z.Code -eq 1) { Write-Log ('   7-Zip предупредил: {0}' -f (Get-7zMessage $z.Output)) 'warn' }
+    else { Write-Log ('   расшифровано за {0}' -f (Format-Span $z.Time)) }
 }
 
 # ---------------------------------------------------------------- копии в хранилище (StoreRoot)
@@ -900,10 +1095,11 @@ function Get-Copies {
                 $name = [string]$m.Name
                 $size = [long]$m.Bytes
                 $status = switch ([string]$m.Status) { 'ok' { 'готово' } 'warn' { 'с замечаниями' } 'err' { 'с ошибками' } 'running' { 'прервано' } default { [string]$m.Status } }
+                if ($m.Encrypted) { $status += ', зашифрована' }
                 $last = @($m.Restores) | Where-Object { $_ } | Select-Object -Last 1
                 if ($last) { $restored = '{0}, {1}' -f $last.PC, ([datetime]$last.Date).ToString('dd.MM HH:mm') }
             }
-            $list.Add([pscustomobject]@{ Login = $ud.Name; Name = $name; Pc = $pcName; When = $when; Bytes = $size; Status = $status; Restored = $restored; Path = $cd.FullName; Manifest = $m })
+            $list.Add([pscustomobject]@{ Login = $ud.Name; Name = $name; Pc = $pcName; When = $when; Bytes = $size; Status = $status; Restored = $restored; Path = $cd.FullName; Manifest = $m; Encrypted = [bool]($m -and $m.Encrypted) })
         }
     }
     return @($list | Sort-Object When -Descending)
@@ -1019,8 +1215,10 @@ function Get-LongPathText {
 }
 
 # Снять копию. $Resolved: ПК, уже найденный и проверенный (Resolve-Pc и Test-PcAccess), для «Перенести сразу».
+# $Password: зашифровать копию. -KeepData: не стирать временную папку зашифрованной копии (DataDir в итоге),
+# из неё «Перенести сразу» развернёт копию без расшифровки.
 # Сообщение не показывает: возвращает итог (Status, Head, LongText) и копию (Path), сообщение собирает тот, кто вызвал
-function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Resolved = $null) {
+function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Resolved = $null, [string]$Password = '', [switch]$KeepData) {
     $t0 = Get-Date
     $script:LongPaths.Clear()
     Write-Log ('=== Снять с ПК: {0} с {1}' -f $Login, $PcName) 'head'
@@ -1037,7 +1235,7 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Res
     Write-Log ('   ПК {0} ({1}) {2}: доступ есть' -f $pc.Name, $pc.Host, $pc.Os)
 
     $results = New-Object System.Collections.Generic.List[object]
-    $dir = $null; $m = $null
+    $dir = $null; $m = $null; $stage = $null; $done = $false
     try {
         $prof = Find-UserProfile $pc $user
         if (-not $prof.Unc) { throw ('На {0} нет профиля {1}: сотрудник на этом ПК не работал?' -f $pc.Name, $user.Login) }
@@ -1051,49 +1249,72 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Res
         $bJobs = Get-BrowserJobs $prof $pc $Groups $null $results
 
         $dir = Join-Path (Join-Path $script:Cfg.StoreRoot $user.Login) ('{0}_{1}' -f (Get-Stamp), $pc.Name)
-        $logs = Join-Path $dir '_logs'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        # Шифруем: собираем копию во временной папке на этом ПК, в хранилище кладём только архив
+        $data = $dir
+        if ($Password) {
+            $stage = New-Staging $user.Login
+            $data = $stage
+            $script:SpaceGuard = $stage
+        }
+        $logs = Join-Path $data '_logs'
         New-Item -ItemType Directory -Path $logs -Force | Out-Null
         $m = [ordered]@{
             Tool = $script:Version; Login = $user.Login; Name = $user.Name; Sid = $user.Sid
             SourcePC = $pc.Name; SourceProfile = $prof.Local; Created = (Get-Date).ToString('s'); Finished = $null
             Operator = ('{0} (окно: {1}\{2} на {3})' -f $script:NetUser, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME)
-            Status = 'running'; Bytes = 0; Items = $results; Restores = @()
+            Status = 'running'; Bytes = 0; Encrypted = [bool]$Password; Archive = $(if ($Password) { 'data.7z' } else { '' }); ArchiveBytes = 0
+            Items = $results; Restores = @()
         }
         Save-Manifest $dir $m
         Write-Log ('   копия: {0}' -f $dir)
+        if ($Password) { Write-Log ('   копия будет зашифрована (7-Zip, AES-256), пока собираю её во временной папке {0}' -f $stage) }
 
         $fx = @(Get-ExcludeArgs @() $script:Cfg.FileExcludes)
         $base = @('/E', '/COPY:DAT', '/DCOPY:T')
         foreach ($j in $bJobs) {
-            $r = Invoke-RoboItem $j.B.Key $j.Ud (Join-Path $dir $j.B.Key) $logs ($base + @(Get-ExcludeArgs $j.B.ExcludeDirs $j.B.ExcludeFiles)) $results
+            $r = Invoke-RoboItem $j.B.Key $j.Ud (Join-Path $data $j.B.Key) $logs ($base + @(Get-ExcludeArgs $j.B.ExcludeDirs $j.B.ExcludeFiles)) $results
             $r.Src = $j.Rel
         }
         $doCrypto = $Groups -contains 'Crypto'
         if ($doCrypto -or @($bJobs | Where-Object { $_.B.Dpapi }).Count) {
             $dp = Join-Path $prof.Unc ($script:Cfg.DpapiPath -replace '\{SID\}', $user.Sid)
-            [void](Invoke-RoboItem 'Dpapi' $dp (Join-Path $dir 'DPAPI') $logs @('/E', '/COPY:DAT') $results)
+            [void](Invoke-RoboItem 'Dpapi' $dp (Join-Path $data 'DPAPI') $logs @('/E', '/COPY:DAT') $results)
         }
         if ($doCrypto) {
             if ($prof.Hklm) {
                 try {
-                    $cr = Export-CryptoReg $prof.Hklm $user (Join-Path $dir 'CryptoPro-Reg')
+                    $cr = Export-CryptoReg $prof.Hklm $user (Join-Path $data 'CryptoPro-Reg')
                     if ($cr.Count) { $r = New-ItemResult 'CryptoReg' 'ok' ('контейнеров {0}: {1}' -f $cr.Count, ($cr.Names -join ', ')) }
                     else { $r = New-ItemResult 'CryptoReg' 'none' 'контейнеров нет' }
                 } catch { $r = New-ItemResult 'CryptoReg' 'err' $_.Exception.Message }
             } else { $r = New-ItemResult 'CryptoReg' 'warn' 'реестр ПК недоступен, контейнеры из реестра не сняты' }
             $results.Add($r); Write-ItemLog $r
-            [void](Invoke-RoboItem 'CryptoDir' (Join-Path $prof.Unc $script:Cfg.CryptoProDir) (Join-Path $dir 'CryptoPro-Dir') $logs $base $results)
-            [void](Invoke-RoboItem 'CertsMy' (Join-Path $prof.Unc $script:Cfg.CertsMyPath) (Join-Path $dir 'Certs-My') $logs $base $results)
-            [void](Invoke-RoboItem 'CertsCrypto' (Join-Path $prof.Unc $script:Cfg.CertsCryptoPath) (Join-Path $dir 'Certs-Crypto') $logs $base $results)
+            [void](Invoke-RoboItem 'CryptoDir' (Join-Path $prof.Unc $script:Cfg.CryptoProDir) (Join-Path $data 'CryptoPro-Dir') $logs $base $results)
+            [void](Invoke-RoboItem 'CertsMy' (Join-Path $prof.Unc $script:Cfg.CertsMyPath) (Join-Path $data 'Certs-My') $logs $base $results)
+            [void](Invoke-RoboItem 'CertsCrypto' (Join-Path $prof.Unc $script:Cfg.CertsCryptoPath) (Join-Path $data 'Certs-Crypto') $logs $base $results)
         }
         foreach ($f in $script:Cfg.Folders) {
             if ($Groups -notcontains $f.Key) { continue }
-            [void](Invoke-RoboItem $f.Key (Join-Path $prof.Unc $f.Path) (Join-Path $dir $f.Key) $logs ($base + $fx) $results)
+            [void](Invoke-RoboItem $f.Key (Join-Path $prof.Unc $f.Path) (Join-Path $data $f.Key) $logs ($base + $fx) $results)
         }
+        Restore-RemoteRegistry   # 7-Zip может работать долго, удалённый реестр старого ПК уже не нужен
+        if ($Password) {
+            $script:SpaceGuard = $null
+            $m.ArchiveBytes = Compress-Copy $data (Join-Path $dir 'data.7z') $Password $results
+        }
+        $done = $true
+    } catch {
+        if ($m) { $m.Error = $_.Exception.Message }
+        throw
     } finally {
+        $script:SpaceGuard = $null
         Restore-RemoteRegistry
+        # Временную папку зашифрованной копии стираем, кроме случая «Перенести сразу» без ошибок: из неё развернём
+        if ($stage -and -not ($KeepData -and $done)) { Remove-Staging $stage; $stage = $null }
         if ($m) {
-            $m.Status = Get-Worst $results
+            # Снятие прервалось (ошибка, окно закрыли): копия неполная, даже если всё, что успели, скопировалось
+            $m.Status = if ($done) { Get-Worst $results } else { 'err' }
             $sum = 0L; foreach ($i in $results) { $sum += [long]$i.Bytes }; $m.Bytes = $sum
             $m.Finished = (Get-Date).ToString('s')
             try { Save-Manifest $dir $m } catch { Write-Log ('   manifest.json не записан: ' + $_.Exception.Message) 'err' }
@@ -1104,14 +1325,18 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Res
     $st = Get-Worst $results
     $lvl = if ($st -eq 'ok') { 'ok' } else { 'warn' }
     Write-Log ('=== Снято: {0}, {1}, за {2}{3}' -f $user.Login, (Format-Size $m.Bytes), (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { '. Есть замечания, см. выше' } else { '' })) $lvl
+    $head = 'Копия снята: {0} ({1}) с {2}, {3}.' -f $user.Name, $user.Login, $pc.Name, (Format-Size $m.Bytes)
+    if ($Password) { $head += ' ' + 'Копия зашифрована паролем: без него её не развернуть.' }
     return [pscustomobject]@{
-        Path     = $dir
-        Status   = $st
-        User     = $user
-        Pc       = $pc
-        Bytes    = [long]$m.Bytes
-        Head     = ('Копия снята: {0} ({1}) с {2}, {3}.' -f $user.Name, $user.Login, $pc.Name, (Format-Size $m.Bytes))
-        LongText = (Get-LongPathText)
+        Path      = $dir
+        DataDir   = $(if ($stage) { $stage } else { $dir })
+        Encrypted = [bool]$Password
+        Status    = $st
+        User      = $user
+        Pc        = $pc
+        Bytes     = [long]$m.Bytes
+        Head      = $head
+        LongText  = (Get-LongPathText)
     }
 }
 
@@ -1122,8 +1347,9 @@ function Get-CopyHas($M, [string]$Key) {
     return ($i -and ($i.Status -in @('ok', 'warn')))
 }
 
-# Развернуть копию. $Resolved: как у Invoke-Capture. Возвращает итог (Status, Head, LongText, Checks)
-function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $null) {
+# Развернуть копию. $Resolved: как у Invoke-Capture. $Password: пароль зашифрованной копии. $DataDir: копия уже
+# расшифрована в эту папку («Перенести сразу»). Возвращает итог (Status, Head, LongText, Checks, Act)
+function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $null, [string]$Password = '', [string]$DataDir = '') {
     $t0 = Get-Date
     $script:LongPaths.Clear()
     $m = Read-Manifest $Copy.Path
@@ -1140,7 +1366,9 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
     Write-Log ('   ПК {0} ({1}) {2}: доступ есть' -f $pc.Name, $pc.Host, $pc.Os)
 
     $results = New-Object System.Collections.Generic.List[object]
-    $src = $Copy.Path
+    $copyDir = $Copy.Path
+    $src = $copyDir
+    $stage = $null
     $stamp = Get-Stamp
     try {
         $prof = Find-UserProfile $pc $user
@@ -1160,10 +1388,26 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
         }
         Write-Log ('   на диске {0}: свободно {1}, переносим {2}' -f $drive, (Format-Size $freeT), (Format-Size $need))
 
+        # Зашифрованная копия: расшифровать во временную папку на этом ПК (у «Перенести сразу» она уже там).
+        # До проверки браузеров: расшифровка долгая, а браузер сотрудник может открыть в любой момент
+        if ($DataDir) { $src = $DataDir }
+        elseif ($m.Encrypted) {
+            if (-not $script:SevenZip) { throw 'Копия зашифрована, а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip в config.psd1' }
+            if (-not $Password) { throw 'Копия зашифрована: нужен её пароль' }
+            $stage = New-Staging $user.Login
+            $freeS = [PmDisk]::Free($stage)
+            if ($freeS -lt [long]$m.Bytes + 1GB) {
+                throw ('Для расшифровки нужно {0} во временной папке {1}, а там свободно {2}. Освободите место или укажите в config.psd1 StagingDir на другом диске' -f (Format-Size ([long]$m.Bytes + 1GB)), $stage, (Format-Size $freeS))
+            }
+            Expand-Copy (Join-Path $copyDir ([string]$m.Archive)) $stage $Password
+            $src = $stage
+        }
+
         $doCrypto = ($Groups -contains 'Crypto')
         $bJobs = Get-BrowserJobs $prof $pc $Groups $m $results
 
-        $logs = Join-Path $src ('_logs\restore_{0}_{1}' -f $stamp, $pc.Name)
+        # Журналы robocopy в копии; у зашифрованной копии на этом ПК (в них имена файлов сотрудника)
+        $logs = if ($m.Encrypted) { Join-Path $script:LogDir ('robocopy\{0}_{1}_restore_{2}' -f $m.Login, $stamp, $pc.Name) } else { Join-Path $copyDir ('_logs\restore_{0}_{1}' -f $stamp, $pc.Name) }
         New-Item -ItemType Directory -Path $logs -Force | Out-Null
         $base = @('/E', '/COPY:DAT', '/DCOPY:T')
         $keep = @('/XC', '/XN', '/XO')
@@ -1233,13 +1477,14 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
         }
     } finally {
         Restore-RemoteRegistry
+        if ($stage) { Remove-Staging $stage }
         $rec = [ordered]@{ PC = $pc.Name; Date = (Get-Date).ToString('s'); Operator = $script:NetUser; Status = (Get-Worst $results); Items = $results }
         try {
-            $m2 = Read-Manifest $src
+            $m2 = Read-Manifest $copyDir
             if ($m2) {
                 $all = @(@($m2.Restores) | Where-Object { $_ }) + @($rec)
                 if ($m2.PSObject.Properties['Restores']) { $m2.Restores = $all } else { $m2 | Add-Member -NotePropertyName Restores -NotePropertyValue $all }
-                Save-Manifest $src $m2
+                Save-Manifest $copyDir $m2
             }
         } catch { Write-Log ('   запись о развёртывании в manifest.json не сохранена: ' + $_.Exception.Message) 'warn' }
         try { Update-Grid } catch { }
@@ -1286,7 +1531,7 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
 
 # Снять со старого ПК и сразу развернуть на новом. Оба ПК проверяем до снятия: без профиля сотрудника
 # на новом ПК развернуть некуда, и снимать копию тогда незачем
-function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$Groups) {
+function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$Groups, [string]$Password = '') {
     $t0 = Get-Date
     Write-Log ('=== Перенести сразу: {0} с {1} на {2}' -f $Login, $OldPc, $NewPc) 'head'
     $user = Get-PmUser $Login
@@ -1301,17 +1546,19 @@ function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$
     if (-not $profNew.Unc) { throw ('Сотрудник ещё не входил на {0}: профиля нет. Пусть войдёт в Windows один раз, потом снова «Перенести сразу». Копия ещё не снималась' -f $pcNew.Name) }
     Write-Log ('   новый ПК {0} ({1}): доступ есть, профиль {2}' -f $pcNew.Name, $pcNew.Host, $profNew.Local)
 
-    $cap = Invoke-Capture $Login $OldPc $Groups $pcOld
-    try { $res = Invoke-Restore ([pscustomobject]@{ Path = $cap.Path }) $NewPc $Groups $pcNew }
+    # Зашифрованную копию разворачиваем из временной папки, где её собрали: расшифровывать архив незачем
+    $cap = Invoke-Capture $Login $OldPc $Groups $pcOld -Password $Password -KeepData
+    try { $res = Invoke-Restore ([pscustomobject]@{ Path = $cap.Path }) $NewPc $Groups $pcNew -DataDir $cap.DataDir }
     catch {
         throw ('Копия снята, но развернуть на {0} не удалось: {1}{2}{2}Копия лежит в хранилище: когда причина будет устранена, выберите её в списке и нажмите «Развернуть на ПК».' -f $pcNew.Name, $_.Exception.Message, "`r`n")
     }
+    finally { if ($cap.DataDir -ne $cap.Path) { Remove-Staging $cap.DataDir } }
     $st = Get-Worst @($cap, $res)
     $span = Format-Span ((Get-Date) - $t0)
     Write-Log ('=== Перенесено: {0} с {1} на {2}, {3}, за {4}' -f $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
     return [pscustomobject]@{
         Status   = $st
-        Head     = ('Перенесено: {0} ({1}) с {2} на {3}, {4} за {5}.' -f $user.Name, $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span)
+        Head     = ('Перенесено: {0} ({1}) с {2} на {3}, {4} за {5}.' -f $user.Name, $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) + $(if ($cap.Encrypted) { ' ' + 'Копия в хранилище зашифрована паролем.' } else { '' })
         LongText = ($cap.LongText + $res.LongText)
         Checks   = $res.Checks
         Act      = $res.Act
@@ -1459,7 +1706,7 @@ table {{ border-collapse: collapse; }}
         (& $h 'Данные'), (& $h 'Файлов'), (& $h 'Объём'), (& $h 'Итог'), (& $h 'Примечание'),
         $rows.ToString(),
         (& $h $sum),
-        (& $h ('На компьютере, с которого сняты данные, ничего не удалялось и не изменялось. Копия данных хранится {0} дней, затем удаляется.' -f $script:Cfg.RetentionDays)),
+        (& $h ('На компьютере, с которого сняты данные, ничего не удалялось и не изменялось. ' + $(if ($M.Encrypted) { 'Копия данных зашифрована паролем (7-Zip, AES-256) и хранится {0} дней, затем удаляется.' } else { 'Копия данных хранится {0} дней, затем удаляется.' }) -f $script:Cfg.RetentionDays)),
         (& $h 'Перенос выполнил'),
         (& $h 'подпись'), (& $h 'фамилия, инициалы'),
         (& $h 'Данные проверил, претензий нет'),
@@ -1548,7 +1795,45 @@ function Get-GroupChecks($Checks) {
     return @($Checks.Keys | Where-Object { $Checks[$_].Checked -and $Checks[$_].Enabled })
 }
 
+# Encrypt = Required, а 7-Zip нет: снимать нельзя
+function Assert-Encrypt {
+    if ($script:Cfg.Encrypt -eq 'Required' -and -not $script:SevenZip) {
+        throw 'В config.psd1 Encrypt = Required (копии только с шифрованием), а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip'
+    }
+}
+
+# Галочка «Зашифровать» и пароль дважды под галочками. Encrypt = Off или нет 7-Zip: ничего не добавляет.
+# Bottom: Y под последним элементом
+function Add-EncryptBox($F, [int]$Y) {
+    $r = [pscustomobject]@{ Check = $null; P1 = $null; P2 = $null; Bottom = $Y }
+    if ($script:Cfg.Encrypt -eq 'Off' -or -not $script:SevenZip) { return $r }
+    $Y += 6
+    $r.Check = New-Check $F 'Зашифровать копию паролем (7-Zip, AES-256)' 24 $Y ($script:Cfg.Encrypt -eq 'On' -or $script:Cfg.Encrypt -eq 'Required')
+    if ($script:Cfg.Encrypt -eq 'Required') { $r.Check.Enabled = $false }
+    $Y += 26
+    [void](New-Label $F 'Пароль:' 42 ($Y + 3) 62)
+    $r.P1 = New-Text $F 106 $Y 140
+    [void](New-Label $F 'Ещё раз:' 256 ($Y + 3) 62)
+    $r.P2 = New-Text $F 320 $Y 126
+    foreach ($t in @($r.P1, $r.P2)) { $t.UseSystemPasswordChar = $true; $t.Enabled = $r.Check.Checked }
+    $r.Check.Tag = @($r.P1, $r.P2)
+    $r.Check.Add_CheckedChanged({ param($s, $e) foreach ($t in $s.Tag) { $t.Enabled = $s.Checked } })
+    $r.Bottom = $Y + 28
+    return $r
+}
+
+# Пароль из Add-EncryptBox: Error (текст, если что-то не так) и Password (пусто: без шифрования)
+function Get-EncryptPassword($Eb) {
+    if (-not $Eb.Check -or -not $Eb.Check.Checked) { return @{ Error = ''; Password = '' } }
+    $p = $Eb.P1.Text
+    $err = Test-CopyPassword $p
+    if (-not $err -and $p -cne $Eb.P2.Text) { $err = 'Пароли не совпадают.' }
+    if (-not $err) { $err = $null }
+    return @{ Error = [string]$err; Password = $p }
+}
+
 function Show-CaptureDialog {
+    Assert-Encrypt
     $f = New-Dialog 'Снять с ПК: данные сотрудника в хранилище' 460 330
     [void](New-Label $f 'Логин сотрудника в AD (например, ivanov_ii):' 12 12)
     $tLogin = New-Text $f 12 32
@@ -1557,20 +1842,23 @@ function Show-CaptureDialog {
     [void](New-Label $f 'Что снять:' 12 122)
     $gc = Add-GroupChecks $f 142
     $checks = $gc.Checks
-    $f.ClientSize = New-Object Drawing.Size(460, ($gc.Bottom + 78))
-    $ok = Add-DialogButtons $f 'Снять' ($gc.Bottom + 32)
+    $eb = Add-EncryptBox $f $gc.Bottom
+    $f.ClientSize = New-Object Drawing.Size(460, ($eb.Bottom + 78))
+    $ok = Add-DialogButtons $f 'Снять' ($eb.Bottom + 32)
     $st = @{}
     $ok.Add_Click({
         $err = ''
         if ($tLogin.Text.Trim() -notmatch '^[A-Za-z0-9._-]{1,64}$') { $err = 'Введите логин сотрудника (латиницей, как в AD).' }
         elseif (-not $tPc.Text.Trim()) { $err = 'Введите имя старого ПК.' }
         elseif (-not (Get-GroupChecks $checks).Count) { $err = 'Отметьте, что снять.' }
+        $pw = Get-EncryptPassword $eb
+        if (-not $err) { $err = $pw.Error }
         if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
-        $st.Login = $tLogin.Text.Trim(); $st.Pc = $tPc.Text.Trim(); $st.Groups = Get-GroupChecks $checks
+        $st.Login = $tLogin.Text.Trim(); $st.Pc = $tPc.Text.Trim(); $st.Groups = Get-GroupChecks $checks; $st.Password = $pw.Password
     })
-    if ($f.ShowDialog($script:MainForm) -ne 'OK') { return }
+    if ($f.ShowDialog($script:MainForm) -ne 'OK') { $f.Dispose(); return }
     $f.Dispose()
-    $r = Invoke-Capture $st.Login $st.Pc $st.Groups
+    $r = Invoke-Capture $st.Login $st.Pc $st.Groups -Password $st.Password
     Show-Result $r 'Дальше: сотрудник один раз входит в Windows на новом ПК, потом в этом окне «Развернуть на ПК».'
 }
 
@@ -1591,12 +1879,17 @@ function Show-RestoreDialog {
     [void](New-Label $f 'Что развернуть (серое: этого нет в копии):' 12 176)
     $gc = Add-GroupChecks $f 196
     $checks = $gc.Checks
-    $f.ClientSize = New-Object Drawing.Size(520, ($gc.Bottom + 74))
-    $ok = Add-DialogButtons $f 'Развернуть' ($gc.Bottom + 28)
+    [void](New-Label $f 'Пароль копии (если она зашифрована):' 24 ($gc.Bottom + 11) 230)
+    $tPass = New-Text $f 258 ($gc.Bottom + 8) 180
+    $tPass.UseSystemPasswordChar = $true
+    $tPass.Enabled = $false
+    $f.ClientSize = New-Object Drawing.Size(520, ($gc.Bottom + 108))
+    $ok = Add-DialogButtons $f 'Развернуть' ($gc.Bottom + 62)
     $st = @{ List = @() }
 
     $fill = {
         $cb.Items.Clear()
+        $tPass.Enabled = $false; $tPass.Text = ''
         $login = $tLogin.Text.Trim()
         $st.List = @($script:Copies | Where-Object { $_.Login -eq $login })
         foreach ($c in $st.List) { [void]$cb.Items.Add(('{0}  с {1},  {2},  {3}{4}' -f $c.When.ToString('dd.MM.yyyy HH:mm'), $c.Pc, (Format-Size $c.Bytes), $c.Status, $(if ($c.Restored) { ',  уже разворачивали: ' + $c.Restored } else { '' }))) }
@@ -1609,6 +1902,8 @@ function Show-RestoreDialog {
     $bFind.Add_Click({ & $fill; if (-not $cb.Items.Count) { [void](Show-Msg ('Копий для «{0}» в хранилище нет.' -f $tLogin.Text.Trim()) 'Warning') } })
     $cb.Add_SelectedIndexChanged({
         $c = $st.List[$cb.SelectedIndex]
+        $tPass.Enabled = $c.Encrypted
+        if (-not $c.Encrypted) { $tPass.Text = '' }
         $m = $c.Manifest
         foreach ($k in @($checks.Keys)) {
             $has = $false
@@ -1630,16 +1925,27 @@ function Show-RestoreDialog {
         if ($tPc.Text.Trim() -ieq $c.Pc) {
             if ((Show-Msg ('Копия снята с этого же ПК ({0}). Разворачивать на него же?' -f $c.Pc) 'Question' 'YesNo') -ne 'Yes') { $f.DialogResult = 'None'; return }
         }
-        $st.Copy = $c; $st.Pc = $tPc.Text.Trim(); $st.Groups = Get-GroupChecks $checks
+        # Пароль зашифрованной копии проверяем сразу (7-Zip читает только список файлов): ошибся, окно не закрывается
+        if ($c.Encrypted) {
+            if (-not $script:SevenZip) { $err = 'Копия зашифрована, а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip в config.psd1.' }
+            elseif (-not $tPass.Text) { $err = 'Копия зашифрована: введите её пароль.' }
+            else {
+                try { $err = Test-ArchivePassword (Join-Path $c.Path ([string]$c.Manifest.Archive)) $tPass.Text }
+                catch { $err = $_.Exception.Message }
+            }
+            if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
+        }
+        $st.Copy = $c; $st.Pc = $tPc.Text.Trim(); $st.Groups = Get-GroupChecks $checks; $st.Password = $tPass.Text
     })
     & $fill
-    if ($f.ShowDialog($script:MainForm) -ne 'OK') { return }
+    if ($f.ShowDialog($script:MainForm) -ne 'OK') { $f.Dispose(); return }
     $f.Dispose()
-    $r = Invoke-Restore $st.Copy $st.Pc $st.Groups
+    $r = Invoke-Restore $st.Copy $st.Pc $st.Groups -Password $st.Password
     Show-Result $r
 }
 
 function Show-MoveDialog {
+    Assert-Encrypt
     $f = New-Dialog 'Перенести сразу: со старого ПК на новый' 460 360
     [void](New-Label $f 'Логин сотрудника в AD (например, ivanov_ii):' 12 12)
     $tLogin = New-Text $f 12 32
@@ -1650,8 +1956,9 @@ function Show-MoveDialog {
     [void](New-Label $f 'Что перенести:' 12 176)
     $gc = Add-GroupChecks $f 196
     $checks = $gc.Checks
-    $f.ClientSize = New-Object Drawing.Size(460, ($gc.Bottom + 78))
-    $ok = Add-DialogButtons $f 'Перенести' ($gc.Bottom + 32)
+    $eb = Add-EncryptBox $f $gc.Bottom
+    $f.ClientSize = New-Object Drawing.Size(460, ($eb.Bottom + 78))
+    $ok = Add-DialogButtons $f 'Перенести' ($eb.Bottom + 32)
     $st = @{}
     $ok.Add_Click({
         $err = ''
@@ -1660,12 +1967,14 @@ function Show-MoveDialog {
         elseif (-not $tNew.Text.Trim()) { $err = 'Введите имя нового ПК.' }
         elseif ($tOld.Text.Trim() -ieq $tNew.Text.Trim()) { $err = 'Старый и новый ПК совпадают. Чтобы вернуть данные на тот же ПК, используйте «Снять с ПК» и «Развернуть на ПК».' }
         elseif (-not (Get-GroupChecks $checks).Count) { $err = 'Отметьте, что перенести.' }
+        $pw = Get-EncryptPassword $eb
+        if (-not $err) { $err = $pw.Error }
         if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
-        $st.Login = $tLogin.Text.Trim(); $st.Old = $tOld.Text.Trim(); $st.New = $tNew.Text.Trim(); $st.Groups = Get-GroupChecks $checks
+        $st.Login = $tLogin.Text.Trim(); $st.Old = $tOld.Text.Trim(); $st.New = $tNew.Text.Trim(); $st.Groups = Get-GroupChecks $checks; $st.Password = $pw.Password
     })
     if ($f.ShowDialog($script:MainForm) -ne 'OK') { $f.Dispose(); return }
     $f.Dispose()
-    $r = Invoke-Move $st.Login $st.Old $st.New $st.Groups
+    $r = Invoke-Move $st.Login $st.Old $st.New $st.Groups $st.Password
     Show-Result $r
 }
 
@@ -1676,6 +1985,7 @@ function Show-CopyDetails {
     Write-Log ('=== Копия {0}' -f $c.Path) 'head'
     if (-not $m) { Write-Log '   manifest.json нет или не читается' 'warn'; return }
     Write-Log ('   {0} ({1}), снята с {2} {3}, оператор {4}, итог: {5}, {6}' -f $m.Name, $m.Login, $m.SourcePC, ([datetime]$m.Created).ToString('dd.MM.yyyy HH:mm'), $m.Operator, $c.Status, (Format-Size $m.Bytes))
+    if ($m.Encrypted) { Write-Log ('   зашифрована паролем (7-Zip, AES-256): {0}, {1}' -f $m.Archive, (Format-Size ([long]$m.ArchiveBytes))) }
     foreach ($i in @($m.Items)) { Write-ItemLog $i }
     foreach ($r in @($m.Restores | Where-Object { $_ })) {
         Write-Log ('   развёрнута на {0} {1}, {2}, итог: {3}' -f $r.PC, ([datetime]$r.Date).ToString('dd.MM.yyyy HH:mm'), $r.Operator, $r.Status)
@@ -1695,7 +2005,7 @@ function Invoke-Guarded([scriptblock]$Action) {
     try { & $Action }
     catch {
         Write-Log ('ОШИБКА: ' + $_.Exception.Message) 'err'
-        [void](Show-Msg ($_.Exception.Message + "`r`n`r`nЖурнал: $($script:LogFile)") 'Error')
+        if (-not $script:Aborting) { [void](Show-Msg ($_.Exception.Message + "`r`n`r`nЖурнал: $($script:LogFile)") 'Error') }
     }
     finally { Set-Busy $false }
 }
@@ -1778,14 +2088,19 @@ try {
             if (-not $chk.AdminUser) { $why += ('{0} не администратор' -f $chk.User) }
             Write-Log ('   окно запущено не на ПК администратора: {0}. Пароль администратора домена введён здесь' -f ($why -join ', ')) 'warn'
         }
-        Invoke-Guarded { Update-Grid; Invoke-Cleanup }
+        Invoke-Guarded { Clear-Staging; Update-Grid; Invoke-Cleanup }
     })
     $form.Add_FormClosing({
         param($s, $e)
         if ($script:Busy) {
-            if ((Show-Msg 'Идёт перенос. Закрыть окно всё равно? Копирование прервётся на середине, его можно будет повторить.' 'Warning' 'YesNo') -ne 'Yes') { $e.Cancel = $true }
+            if ((Show-Msg 'Идёт перенос. Закрыть окно всё равно? Копирование прервётся на середине, его можно будет повторить.' 'Warning' 'YesNo') -ne 'Yes') { $e.Cancel = $true; return }
+            # robocopy и 7-Zip останавливаются, служба «Удалённый реестр» возвращается как была, временная папка стирается
+            $script:Aborting = $true
         }
     })
+    # Временная папка, которая не стёрлась после работы (файл был занят): ещё попытка. Если окно закрыли во время
+    # работы, папку стирает сама прерванная операция
+    $form.Add_FormClosed({ if (-not $script:Busy) { try { Clear-Staging -Own } catch { } } })
     [void]$form.ShowDialog()
 }
 catch {

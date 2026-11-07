@@ -149,13 +149,15 @@ function Get-PmUser([string]$Login) { [pscustomobject]@{ Login = $Login; Name = 
 function Resolve-Pc([string]$Name) { [pscustomobject]@{ Name = $Name.ToUpper(); Host = $script:Hosts[$Name]; Ips = @(); Os = ''; ByIp = $false } }
 function Test-PcAccess($Pc) { }
 function Restore-RemoteRegistry { }
+function Remove-Staging([string]$Dir) { $script:Calls.Add(('wipe {0}' -f $Dir)) }
 function Find-UserProfile($Pc, $User) { [pscustomobject]@{ Unc = $script:NewProfile; Local = 'C:\Users\ivanov' } }
-function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Resolved) {
+function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Resolved, [string]$Password, [switch]$KeepData) {
     $script:Calls.Add(('capture {0}' -f $Resolved.Name))
-    [pscustomobject]@{ Path = '\\nas\Migrate\ivanov\copy'; Status = 'ok'; Bytes = 3GB; Head = 'h'; LongText = '' }
+    $p = '\\nas\Migrate\ivanov\copy'
+    [pscustomobject]@{ Path = $p; DataDir = $(if ($Password) { 'C:\stage' } else { $p }); Encrypted = [bool]$Password; Status = 'ok'; Bytes = 3GB; Head = 'h'; LongText = '' }
 }
-function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved) {
-    $script:Calls.Add(('restore {0} {1}' -f $Copy.Path, $Resolved.Name))
+function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved, [string]$Password, [string]$DataDir) {
+    $script:Calls.Add(('restore {0} {1} {2}' -f $Copy.Path, $Resolved.Name, $DataDir))
     if ($script:RestoreFails) { throw 'нет связи' }
     [pscustomobject]@{ Status = 'warn'; Head = 'h'; LongText = ''; Checks = 'Проверить с сотрудником: файлы.' }
 }
@@ -167,11 +169,17 @@ $script:NewProfile = $null
 Check 'перенос: нет профиля на новом ПК, копию не снимаем' ((Throws { Invoke-Move 'ivanov' 'pc-old' 'pc-new' @('Desktop') } '*ещё не входил*') -and -not $script:Calls.Count)
 $script:NewProfile = '\\10.0.0.2\C$\Users\ivanov'
 $mv = Invoke-Move 'ivanov' 'pc-old' 'pc-new' @('Desktop')
-Check 'перенос: снять, потом развернуть эту копию' (($script:Calls -join '; ') -eq 'capture PC-OLD; restore \\nas\Migrate\ivanov\copy PC-NEW')
+Check 'перенос: снять, потом развернуть эту копию' (($script:Calls -join '; ') -eq 'capture PC-OLD; restore \\nas\Migrate\ivanov\copy PC-NEW \\nas\Migrate\ivanov\copy')
 Check 'перенос: итог худший из двух' ($mv.Status -eq 'warn')
 Check 'перенос: заголовок' ($mv.Head -like '*Иванов И. И. (ivanov)*PC-OLD*PC-NEW*3,0*' -or $mv.Head -like '*Иванов И. И. (ivanov)*PC-OLD*PC-NEW*3.0*')
 $script:RestoreFails = $true
 Check 'перенос: развернуть не удалось, копия остаётся' (Throws { Invoke-Move 'ivanov' 'pc-old' 'pc-new' @('Desktop') } 'Копия снята, но развернуть на PC-NEW не удалось: нет связи*')
+$script:RestoreFails = $false
+$script:Calls.Clear()
+$mv2 = Invoke-Move 'ivanov' 'pc-old' 'pc-new' @('Desktop') 'Passw0rd!'
+Check 'перенос с шифрованием: развернуть из временной папки и стереть её' (($script:Calls -join '; ') -eq 'capture PC-OLD; restore \\nas\Migrate\ivanov\copy PC-NEW C:\stage; wipe C:\stage' -and $mv2.Head -like '*зашифрована*')
+$script:Calls.Clear(); $script:RestoreFails = $true
+Check 'перенос с шифрованием: при ошибке временная папка тоже стирается' ((Throws { Invoke-Move 'ivanov' 'pc-old' 'pc-new' @('Desktop') 'Passw0rd!' } 'Копия снята*') -and ($script:Calls -join '; ') -like '*wipe C:\stage')
 $script:RestoreFails = $false
 
 Show-Result $mv
@@ -210,6 +218,59 @@ try {
     $html3 = [IO.File]::ReadAllText((New-Act $man $rec), [Text.Encoding]::UTF8)
     Check 'акт: тот же ПК = восстановление' ($html3 -like '*восстановления данных*' -and $html3 -like '*Восстановлено:*')
 } finally { Remove-Item -LiteralPath $script:LogDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ---------------------------------------------------------------- 8. шифрование: пароль и настоящий 7-Zip, если он есть
+
+. (Get-Fn 'Test-CopyPassword', 'Get-7zMessage', 'Format-Arg', 'Stop-Child', 'Invoke-7z', 'Compress-Copy', 'Test-ArchivePassword', 'Expand-Copy', 'Get-EncryptPassword')
+Check 'пароль: короткий' ((Test-CopyPassword 'Abc123!') -like '*8*')
+Check 'пароль: русские буквы' ((Test-CopyPassword 'Пароль12345') -like '*латинские*')
+Check 'пароль: пробел в конце' ((Test-CopyPassword 'Passw0rd! ') -like '*пробелов*')
+Check 'пароль: годный, с пробелом внутри и знаками' ((Test-CopyPassword 'Pa ss"w0rd''$%^&*') -eq '')
+$eb = [pscustomobject]@{ Check = [pscustomobject]@{ Checked = $true }; P1 = [pscustomobject]@{ Text = 'Passw0rd!' }; P2 = [pscustomobject]@{ Text = 'passw0rd!' } }
+Check 'пароль: повтор с другим регистром не совпадает' ((Get-EncryptPassword $eb).Error -like '*не совпадают*')
+$eb.P2.Text = 'Passw0rd!'
+$gp = Get-EncryptPassword $eb
+Check 'пароль: совпал' ($gp.Error -eq '' -and $gp.Password -eq 'Passw0rd!')
+$eb.Check.Checked = $false
+Check 'без шифрования: пароля нет' ((Get-EncryptPassword $eb).Password -eq '')
+
+$z7 = @('C:\Program Files\7-Zip\7z.exe', '/usr/bin/7zz', '/usr/bin/7z') | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $z7) { Write-Host 'SKIP 7-Zip не найден: проверки архива пропущены' -ForegroundColor Yellow }
+else {
+    # DoEvents из WinForms: в PowerShell 7 на Linux его нет, хватит пустого
+    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch { }
+    if (-not ('System.Windows.Forms.Application' -as [type])) { Add-Type -TypeDefinition 'namespace System.Windows.Forms { public static class Application { public static void DoEvents() { } } }' }
+    $script:SevenZip = $z7; $script:MainForm = $null; $script:AppTitle = 'test'; $script:ProgressLogSec = 30; $script:Aborting = $false
+    $script:Titles['Archive'] = 'Шифрование'
+    $zt = Join-Path ([IO.Path]::GetTempPath()) ('pmtest-7z-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $src = Join-Path $zt 'stage 1'
+        New-Item -ItemType Directory -Path (Join-Path $src 'Desktop/Папка с пробелом') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $src 'DPAPI') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $src 'Desktop/Папка с пробелом/документ.txt'), 'Привет, мир')
+        [IO.File]::WriteAllBytes((Join-Path $src 'DPAPI/key'), [byte[]](1..255))
+        $pw = 'Pa ss"w0rd''$%^&*'
+        $arch = Join-Path $zt 'copy/data.7z'
+        New-Item -ItemType Directory -Path (Split-Path $arch) -Force | Out-Null
+        $res7 = New-Object System.Collections.Generic.List[object]
+        $size = Compress-Copy $src $arch $pw $res7
+        Check '7-Zip: архив создан' ((Test-Path -LiteralPath $arch) -and $size -gt 0 -and $res7[0].Status -eq 'ok' -and $res7[0].Key -eq 'Archive')
+        Check '7-Zip: пароль подходит' ((Test-ArchivePassword $arch $pw) -eq '')
+        Check '7-Zip: неверный пароль' ((Test-ArchivePassword $arch 'Wrong-password-1') -eq 'Неверный пароль копии.')
+        Check '7-Zip: без пароля имена файлов не видны' (-not ((& $z7 l -p'' -- $arch 2>&1) -join "`n" -like '*документ*'))
+        $out = Join-Path $zt 'out'
+        New-Item -ItemType Directory -Path $out | Out-Null
+        Expand-Copy $arch $out $pw
+        Check '7-Zip: распаковано как было' (([IO.File]::ReadAllText((Join-Path $out 'Desktop/Папка с пробелом/документ.txt'))) -eq 'Привет, мир' -and ([IO.File]::ReadAllBytes((Join-Path $out 'DPAPI/key'))).Length -eq 255)
+        Check '7-Zip: распаковка с неверным паролем' (Throws { Expand-Copy $arch (Join-Path $zt 'out2') 'Wrong-password-1' } 'Неверный пароль копии')
+        # Архив не создать (на месте папки файл): строка «Шифрование» с ошибкой, недоделанного архива нет
+        $res8 = New-Object System.Collections.Generic.List[object]
+        [IO.File]::WriteAllText((Join-Path $zt 'file'), 'x')
+        $bad7 = Join-Path $zt 'file/data.7z'
+        [void](Compress-Copy $src $bad7 $pw $res8)
+        Check '7-Zip: ошибка, архива нет' ($res8[0].Status -eq 'err' -and $res8[0].Note -like '*код 2*' -and -not (Test-Path -LiteralPath $bad7))
+    } finally { Remove-Item -LiteralPath $zt -Recurse -Force -ErrorAction SilentlyContinue }
+}
 
 # ----------------------------------------------------------------
 
