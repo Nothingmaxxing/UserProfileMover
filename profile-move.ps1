@@ -28,6 +28,39 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.DirectorySer
 
 $script:Root = $PSScriptRoot
 
+# ---------------------------------------------------------------- язык окна
+
+# Строки окна написаны по-русски, T переводит их по lang\<язык>.psd1, где ключ = русский текст. Нет перевода: остаётся
+# русский. Пробелы в начале строки (отступы журнала) в ключ не входят. Такие же T и Set-Language в start.ps1
+$script:Tr = @{}
+$script:Lang = 'ru'
+function T([string]$Text) {
+    if (-not $script:Tr.Count) { return $Text }
+    $k = $Text.TrimStart(' ')
+    $v = $script:Tr[$k]
+    if ($null -eq $v) { return $Text }
+    return $Text.Substring(0, $Text.Length - $k.Length) + $v
+}
+
+# Language в config.psd1: auto (русский, если язык Windows или её региональные настройки русские, иначе английский), ru, en
+function Set-Language([string]$Lang, [string]$Root) {
+    if (-not $Lang -or $Lang -eq 'auto') {
+        $Lang = if ((Get-UICulture).TwoLetterISOLanguageName -eq 'ru' -or (Get-Culture).TwoLetterISOLanguageName -eq 'ru') { 'ru' } else { 'en' }
+    }
+    $script:Lang = 'ru'
+    $script:Tr = @{}
+    $f = Join-Path $Root ('lang\{0}.psd1' -f $Lang)
+    if ($Lang -ne 'ru' -and $Lang -match '^[a-z]{2}$' -and (Test-Path -LiteralPath $f)) {
+        $script:Tr = Import-PowerShellDataFile -LiteralPath $f
+        $script:Lang = $Lang
+    }
+    $ru = ($script:Lang -eq 'ru')
+    $script:DateFmt = if ($ru) { 'dd.MM.yyyy HH:mm' } else { 'yyyy-MM-dd HH:mm' }
+    $script:DayFmt = if ($ru) { 'dd.MM.yyyy' } else { 'yyyy-MM-dd' }
+    $script:ShortFmt = if ($ru) { 'dd.MM HH:mm' } else { 'MM-dd HH:mm' }
+}
+try { Set-Language 'auto' $script:Root } catch { Set-Language 'ru' $script:Root }
+
 # Браузеры из config.psd1 с настройками по умолчанию. В config.psd1 до версии 1.4 браузер один: Яндекс из YandexPath
 function Initialize-Browsers($Cfg) {
     $chDirs = @('Cache', 'Code Cache', 'GPUCache', 'GrShaderCache', 'GraphiteDawnCache', 'ShaderCache',
@@ -41,29 +74,29 @@ function Initialize-Browsers($Cfg) {
     if ($Cfg.ContainsKey('ChromiumLockFiles')) { $chLocks = @($Cfg.ChromiumLockFiles | Where-Object { $_ }) }
     $src = @($Cfg.Browsers | Where-Object { $_ })
     if (-not $Cfg.ContainsKey('Browsers') -and $Cfg.YandexPath) {
-        $src = @(@{ Key = 'Yandex'; Title = 'Яндекс Браузер'; Enabled = ($Cfg.EnableYandex -ne $false); UserData = @($Cfg.YandexPath)
+        $src = @(@{ Key = 'Yandex'; Title = (T 'Яндекс Браузер'); Enabled = ($Cfg.EnableYandex -ne $false); UserData = @($Cfg.YandexPath)
             ExcludeDirs = $Cfg.YandexExcludeDirs; ExcludeFiles = $Cfg.YandexExcludeFiles; Exe = $Cfg.YandexExe })
     }
     $taken = @('Dpapi', 'Crypto', 'CryptoReg', 'CryptoDir', 'CertsMy', 'CertsCrypto') + @($Cfg.Folders | ForEach-Object { [string]$_.Key })
     $seen = @{}
     foreach ($b in $src) {
         $key = [string]$b.Key
-        if ($key -notmatch '^[A-Za-z0-9]+$') { throw ('браузер «{0}»: Key должен быть из латинских букв и цифр, а он «{1}»' -f $b.Title, $key) }
-        if ($taken -contains $key -or $seen.ContainsKey($key)) { throw ('браузер «{0}»: Key «{1}» уже занят папкой, подписями или другим браузером' -f $b.Title, $key) }
+        if ($key -notmatch '^[A-Za-z0-9]+$') { throw ((T 'браузер «{0}»: Key должен быть из латинских букв и цифр, а он «{1}»') -f $b.Title, $key) }
+        if ($taken -contains $key -or $seen.ContainsKey($key)) { throw ((T 'браузер «{0}»: Key «{1}» уже занят папкой, подписями или другим браузером') -f $b.Title, $key) }
         $seen[$key] = $true
         if ($b.Enabled -eq $false) { continue }
         $ud = @($b.UserData | Where-Object { $_ })
-        if (-not $ud.Count) { throw ('браузер «{0}»: не указан UserData' -f $b.Title) }
+        if (-not $ud.Count) { throw ((T 'браузер «{0}»: не указан UserData') -f $b.Title) }
         [pscustomobject]@{
             Key          = $key
-            Title        = $(if ($b.Title) { [string]$b.Title } else { $key })
+            Title        = $(if ($b.Title) { T ([string]$b.Title) } else { $key })
             UserData     = $ud
             Dpapi        = ($b.Dpapi -ne $false)
             LockFiles    = $(if ($b.ContainsKey('LockFiles')) { @($b.LockFiles | Where-Object { $_ }) } else { $chLocks })
             ExcludeDirs  = $(if ($b.ContainsKey('ExcludeDirs')) { @($b.ExcludeDirs | Where-Object { $_ }) } else { $chDirs })
             ExcludeFiles = $(if ($b.ContainsKey('ExcludeFiles')) { @($b.ExcludeFiles | Where-Object { $_ }) } else { $chFiles })
             Exe          = @($b.Exe | Where-Object { $_ })
-            Note         = [string]$b.Note
+            Note         = $(if ($b.Note) { T ([string]$b.Note) } else { '' })
         }
     }
 }
@@ -79,17 +112,18 @@ function Find-7z($Cfg) {
 # Ошибку в config.psd1 показываем окном: этот скрипт запускается без консоли
 try {
     $script:Cfg = Import-PowerShellDataFile -Path (Join-Path $script:Root 'config.psd1')
+    Set-Language ([string]$script:Cfg.Language) $script:Root
     if (-not $script:Cfg.Domain) { $script:Cfg.Domain = $env:USERDNSDOMAIN }
     if ($null -eq $script:Cfg.EnableCryptoPro) { $script:Cfg.EnableCryptoPro = $true }
     if ($null -eq $script:Cfg.Act) { $script:Cfg.Act = $true }
     if (-not $script:Cfg.Encrypt) { $script:Cfg.Encrypt = 'Optional' }
-    if (@('Off', 'Optional', 'On', 'Required') -notcontains $script:Cfg.Encrypt) { throw ('Encrypt = «{0}», а можно Off, Optional, On или Required' -f $script:Cfg.Encrypt) }
+    if (@('Off', 'Optional', 'On', 'Required') -notcontains $script:Cfg.Encrypt) { throw ((T 'Encrypt = «{0}», а можно Off, Optional, On или Required') -f $script:Cfg.Encrypt) }
     $script:SevenZip = Find-7z $script:Cfg
     $script:Staging = if ($script:Cfg.StagingDir) { [string]$script:Cfg.StagingDir } else { Join-Path $env:TEMP 'profile-move' }
     $script:Browsers = @(Initialize-Browsers $script:Cfg)
 } catch {
     if ($NoGui) { throw }
-    [void][System.Windows.Forms.MessageBox]::Show(('Ошибка в config.psd1: {0}' -f $_.Exception.Message), 'Перенос профиля', 'OK', 'Error')
+    [void][System.Windows.Forms.MessageBox]::Show(((T 'Ошибка в config.psd1: {0}') -f $_.Exception.Message), (T 'Перенос профиля'), 'OK', 'Error')
     exit 1
 }
 $script:LogDir = Join-Path $script:Root 'logs'
@@ -100,7 +134,7 @@ $script:AppVersion = '1.5'   # сравнивается с последним р
 $script:Version = 'profile-move 1.5 (08.11.2026)'
 $script:UpdateLink = $null
 $script:Upd = $null
-$script:AppTitle = 'Перенос профиля'
+$script:AppTitle = (T 'Перенос профиля')
 $script:Busy = $false
 $script:LogBox = $null
 $script:Grid = $null
@@ -120,15 +154,15 @@ $script:Aborting = $false    # окно закрывают во время ра�
 $script:InCleanup = $false   # стираем временную папку: это не останавливать
 
 $script:Titles = [ordered]@{
-    Yandex      = 'Яндекс Браузер'
-    Dpapi       = 'Ключи DPAPI'
-    CryptoReg   = 'КриптоПро: контейнеры в реестре'
-    CryptoDir   = 'КриптоПро: папка «Директория»'
-    CertsMy     = 'Личные сертификаты'
-    CertsCrypto = 'Ключи Windows к сертификатам'
-    Archive     = 'Шифрование (7-Zip, AES-256)'
+    Yandex      = (T 'Яндекс Браузер')
+    Dpapi       = (T 'Ключи DPAPI')
+    CryptoReg   = (T 'КриптоПро: контейнеры в реестре')
+    CryptoDir   = (T 'КриптоПро: папка «Директория»')
+    CertsMy     = (T 'Личные сертификаты')
+    CertsCrypto = (T 'Ключи Windows к сертификатам')
+    Archive     = (T 'Шифрование (7-Zip, AES-256)')
 }
-foreach ($f in $script:Cfg.Folders) { $script:Titles[[string]$f.Key] = [string]$f.Title }
+foreach ($f in $script:Cfg.Folders) { $script:Titles[[string]$f.Key] = T ([string]$f.Title) }
 foreach ($b in $script:Browsers) { $script:Titles[$b.Key] = $b.Title }
 # Галочки в окнах: группа «Подписи» = все части КриптоПро и сертификатов
 $script:CryptoKeys = @('CryptoReg', 'CryptoDir', 'CertsMy', 'CertsCrypto')
@@ -201,15 +235,15 @@ function Show-Msg([string]$Text, [string]$Icon = 'Information', [string]$Buttons
 }
 
 function Format-Size([double]$Bytes) {
-    if ($Bytes -ge 1GB) { return ('{0:N1} ГБ' -f ($Bytes / 1GB)) }
-    if ($Bytes -ge 1MB) { return ('{0:N0} МБ' -f ($Bytes / 1MB)) }
-    if ($Bytes -ge 1KB) { return ('{0:N0} КБ' -f ($Bytes / 1KB)) }
-    return ('{0:N0} Б' -f $Bytes)
+    if ($Bytes -ge 1GB) { return ((T '{0:N1} ГБ') -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ((T '{0:N0} МБ') -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ((T '{0:N0} КБ') -f ($Bytes / 1KB)) }
+    return ((T '{0:N0} Б') -f $Bytes)
 }
 
 function Format-Span([TimeSpan]$T) {
-    if ($T.TotalMinutes -ge 1) { return ('{0} мин {1} с' -f [int][Math]::Floor($T.TotalMinutes), $T.Seconds) }
-    return ('{0} с' -f [int]$T.TotalSeconds)
+    if ($T.TotalMinutes -ge 1) { return ((T '{0} мин {1} с') -f [int][Math]::Floor($T.TotalMinutes), $T.Seconds) }
+    return ((T '{0} с') -f [int]$T.TotalSeconds)
 }
 
 function Get-ErrCode($Err) {
@@ -292,7 +326,7 @@ function Find-Ad([string]$Filter, [string[]]$Props) {
         foreach ($p in $Props) { [void]$ds.PropertiesToLoad.Add($p) }
         try {
             $r = @($ds.FindAll())
-            if ($script:AdPath -and $script:AdPath -ne $path) { Write-Log ('   AD не ответил через {0}, работаю через {1}' -f $script:AdPath, $path) 'warn' }
+            if ($script:AdPath -and $script:AdPath -ne $path) { Write-Log ((T '   AD не ответил через {0}, работаю через {1}') -f $script:AdPath, $path) 'warn' }
             $script:AdPath = $path
             return $r
         } catch {
@@ -300,7 +334,7 @@ function Find-Ad([string]$Filter, [string[]]$Props) {
             [void]$script:AdRoots.Remove($path)
         } finally { $ds.Dispose() }
     }
-    throw ('Нет связи с AD ({0}): {1}' -f ($paths -join ', '), $(if ($last) { $last.Message } else { '' }))
+    throw ((T 'Нет связи с AD ({0}): {1}') -f ($paths -join ', '), $(if ($last) { $last.Message } else { '' }))
 }
 
 function Get-AdProp($R, [string]$N) {
@@ -309,9 +343,9 @@ function Get-AdProp($R, [string]$N) {
 }
 
 function Get-PmUser([string]$Login) {
-    if ($Login -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw "Логин «$Login» не похож на логин AD (латиница, цифры, точка, подчёркивание)" }
+    if ($Login -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw ((T 'Логин «{0}» не похож на логин AD (латиница, цифры, точка, подчёркивание)') -f $Login) }
     $r = @(Find-Ad "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$Login))" @('samaccountname', 'displayname', 'objectsid', 'useraccountcontrol'))
-    if (-not $r.Count) { throw "В AD нет пользователя $Login" }
+    if (-not $r.Count) { throw ((T 'В AD нет пользователя {0}') -f $Login) }
     $x = $r[0]
     $sid = (New-Object Security.Principal.SecurityIdentifier([byte[]](Get-AdProp $x 'objectsid'), 0)).Value
     [pscustomobject]@{
@@ -334,7 +368,7 @@ function Resolve-PcIp([string]$Fqdn) {
         try {
             $ips = @(Resolve-DnsName -Name $Fqdn -Type A -Server $script:Cfg.DcIp -DnsOnly -QuickTimeout -ErrorAction Stop |
                 Where-Object { [string]$_.Type -eq 'A' } | ForEach-Object { [string]$_.IPAddress })
-        } catch { Write-Log ('   DNS контроллера домена ({0}) не знает {1}: {2}' -f $script:Cfg.DcIp, $Fqdn, $_.Exception.Message) 'warn' }
+        } catch { Write-Log ((T '   DNS контроллера домена ({0}) не знает {1}: {2}') -f $script:Cfg.DcIp, $Fqdn, $_.Exception.Message) 'warn' }
     }
     if (-not $ips.Count) {
         try {
@@ -350,7 +384,7 @@ function Resolve-PcIp([string]$Fqdn) {
 function Resolve-Pc([string]$Name) {
     $Name = $Name.Trim()
     if ($Name -match '^\d{1,3}(\.\d{1,3}){3}$') { return [pscustomobject]@{ Name = $Name; Host = $Name; Ips = @($Name); Os = ''; ByIp = $true } }
-    if ($Name -notmatch '^[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9.-]+)?$') { throw "Имя ПК «$Name» не похоже на имя компьютера" }
+    if ($Name -notmatch '^[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9.-]+)?$') { throw ((T 'Имя ПК «{0}» не похоже на имя компьютера') -f $Name) }
     $short = ($Name -split '\.')[0]
     $pc = [pscustomobject]@{ Name = $short.ToUpper(); Host = ''; Ips = @(); Os = ''; ByIp = $false }
     $fqdn = if ($Name -match '\.') { $Name } else { '{0}.{1}' -f $short, $script:Cfg.Domain }
@@ -360,9 +394,9 @@ function Resolve-Pc([string]$Name) {
         $pc.Os = [string](Get-AdProp $r[0] 'operatingsystem')
         $dns = [string](Get-AdProp $r[0] 'dnshostname')
         if ($dns) { $fqdn = $dns }
-    } else { Write-Log "   ПК $short в AD не найден, ищу его в DNS" 'warn' }
+    } else { Write-Log ((T '   ПК {0} в AD не найден, ищу его в DNS') -f $short) 'warn' }
     $pc.Ips = @(Resolve-PcIp $fqdn)
-    if (-not $pc.Ips.Count) { throw ('Не нашёл IP {0} в DNS{1}: ПК давно не включался? Введите вместо имени его IP' -f $fqdn, $(if ($script:Cfg.DcIp) { ' контроллера домена (' + $script:Cfg.DcIp + ')' } else { '' })) }
+    if (-not $pc.Ips.Count) { throw ((T 'Не нашёл IP {0} в DNS{1}: ПК давно не включался? Введите вместо имени его IP') -f $fqdn, $(if ($script:Cfg.DcIp) { (T ' контроллера домена (') + $script:Cfg.DcIp + ')' } else { '' })) }
     $pc.Host = $pc.Ips[0]
     return $pc
 }
@@ -383,7 +417,7 @@ function Enable-RemoteRegistry([string]$TargetHost) {
             $script:RrState[$TargetHost] = $state      # запомнить до запуска: вернуть как было, даже если запуск упадёт
             $svc.Start()
             $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
-            Write-Log ('   служба «Удалённый реестр» на {0} включена на время работы (была: {1})' -f (Get-HostLabel $TargetHost), $state.StartType)
+            Write-Log ((T '   служба «Удалённый реестр» на {0} включена на время работы (была: {1})') -f (Get-HostLabel $TargetHost), $state.StartType)
         }
         $script:RrState[$TargetHost] = $state
     } finally { $svc.Dispose() }
@@ -402,9 +436,9 @@ function Restore-RemoteRegistry {
                 $out = & sc.exe "\\$h" config RemoteRegistry start= disabled 2>&1
                 if ($LASTEXITCODE -ne 0) { throw ('sc config: {0}' -f ($out -join ' ')) }
             }
-            Write-Log ('   служба «Удалённый реестр» на {0} возвращена как была ({1}, остановлена)' -f (Get-HostLabel $h), $st.StartType)
+            Write-Log ((T '   служба «Удалённый реестр» на {0} возвращена как была ({1}, остановлена)') -f (Get-HostLabel $h), $st.StartType)
         } catch {
-            Write-Log ('   не удалось вернуть службу «Удалённый реестр» на {0}: {1}. Вернуть руками: services.msc на этом ПК' -f (Get-HostLabel $h), $_.Exception.Message) 'warn'
+            Write-Log ((T '   не удалось вернуть службу «Удалённый реестр» на {0}: {1}. Вернуть руками: services.msc на этом ПК') -f (Get-HostLabel $h), $_.Exception.Message) 'warn'
         }
     }
     $script:RrState = @{}
@@ -421,12 +455,12 @@ function Open-RemoteHklm([string]$TargetHost) {
             return $k
         } catch { $last = $_; Wait-Ui 2 }
     }
-    throw ('реестр {0} недоступен: {1}' -f (Get-HostLabel $TargetHost), $last.Exception.Message)
+    throw ((T 'реестр {0} недоступен: {1}') -f (Get-HostLabel $TargetHost), $last.Exception.Message)
 }
 
 function ConvertTo-Unc([string]$TargetHost, [string]$LocalPath) {
     if ($LocalPath -match '^([A-Za-z]):\\(.*)$') { return ('\\{0}\{1}$\{2}' -f $TargetHost, $Matches[1].ToUpper(), $Matches[2].TrimEnd('\')) }
-    throw "Не понимаю путь профиля «$LocalPath»"
+    throw ((T 'Не понимаю путь профиля «{0}»') -f $LocalPath)
 }
 
 # Профиль сотрудника на ПК: путь из ProfileList по SID (точно), иначе папка C:\Users\<логин> (если реестр недоступен)
@@ -442,14 +476,14 @@ function Find-UserProfile($Pc, $User) {
             if ($p) { $res.Local = $p; $res.Unc = ConvertTo-Unc $Pc.Host $p; $res.ByRegistry = $true }
         }
         $bak = $hk.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($User.Sid).bak")
-        if ($bak) { $bak.Close(); Write-Log ('   на {0} у сотрудника есть запись профиля .bak: возможно, он входил во временный профиль' -f $Pc.Name) 'warn' }
+        if ($bak) { $bak.Close(); Write-Log ((T '   на {0} у сотрудника есть запись профиля .bak: возможно, он входил во временный профиль') -f $Pc.Name) 'warn' }
     } catch {
-        Write-Log ('   {0}. Профиль ищу по папке, контейнеры КриптоПро из реестра будут пропущены' -f $_.Exception.Message) 'warn'
+        Write-Log ((T '   {0}. Профиль ищу по папке, контейнеры КриптоПро из реестра будут пропущены') -f $_.Exception.Message) 'warn'
         $guess = '\\{0}\C$\Users\{1}' -f $Pc.Host, $User.Login
         if (Test-Path -LiteralPath $guess) { $res.Local = 'C:\Users\' + $User.Login; $res.Unc = $guess }
     }
     if ($res.Unc -and -not (Test-Path -LiteralPath $res.Unc)) {
-        Write-Log ('   в реестре профиль {0}, но папки нет' -f $res.Local) 'warn'
+        Write-Log ((T '   в реестре профиль {0}, но папки нет') -f $res.Local) 'warn'
         $res.Unc = $null
     }
     if ($res.Unc) { $res.Loaded = Test-Locked (Join-Path $res.Unc 'NTUSER.DAT') }
@@ -468,12 +502,12 @@ function Get-HostLabel([string]$H) {
 function Test-PcAccess($Pc) {
     $alive = @($Pc.Ips | Where-Object { Test-Port $_ 445 })
     if (-not $alive.Count) {
-        throw ('{0} ({1}) не отвечает по SMB (порт 445): ПК выключен, не в сети или брандмауэр на нём не пускает SMB с этого ПК' -f $Pc.Name, ($Pc.Ips -join ', '))
+        throw ((T '{0} ({1}) не отвечает по SMB (порт 445): ПК выключен, не в сети или брандмауэр на нём не пускает SMB с этого ПК') -f $Pc.Name, ($Pc.Ips -join ', '))
     }
     $chosen = $null; $unchecked = $null; $others = @()
     foreach ($ip in $alive) {
         $nm = $null
-        try { $nm = Get-RemoteName $ip } catch { Write-Log ('   по адресу {0} не удалось спросить имя ПК: {1}' -f $ip, $_.Exception.Message) 'warn' }
+        try { $nm = Get-RemoteName $ip } catch { Write-Log ((T '   по адресу {0} не удалось спросить имя ПК: {1}') -f $ip, $_.Exception.Message) 'warn' }
         if (-not $nm) { if (-not $unchecked) { $unchecked = $ip }; continue }
         if ($Pc.ByIp) { $Pc.Name = $nm.ToUpper(); $chosen = $ip; break }
         if ($nm -ieq $Pc.Name) { $chosen = $ip; break }
@@ -481,15 +515,15 @@ function Test-PcAccess($Pc) {
     }
     if (-not $chosen) {
         if (-not $unchecked) {
-            throw ('В DNS {0} = {1}, но там отвечает другой ПК ({2}): запись DNS устарела. Введите вместо имени настоящий IP {0}' -f $Pc.Name, ($alive -join ', '), ($others -join '; '))
+            throw ((T 'В DNS {0} = {1}, но там отвечает другой ПК ({2}): запись DNS устарела. Введите вместо имени настоящий IP {0}') -f $Pc.Name, ($alive -join ', '), ($others -join '; '))
         }
         $chosen = $unchecked
-        Write-Log ('   что по адресу {0} отвечает именно {1}, проверить не удалось' -f $chosen, $Pc.Name) 'warn'
+        Write-Log ((T '   что по адресу {0} отвечает именно {1}, проверить не удалось') -f $chosen, $Pc.Name) 'warn'
     }
     $Pc.Host = $chosen
     $script:HostNames[$chosen] = $Pc.Name
     if (-not (Test-Path -LiteralPath ('\\{0}\C$\Windows' -f $Pc.Host))) {
-        throw ('Нет доступа к \\{0}\C$ ({1}) под учёткой {2}: она не администратор на этом ПК?' -f $Pc.Host, $Pc.Name, $script:NetUser)
+        throw ((T 'Нет доступа к \\{0}\C$ ({1}) под учёткой {2}: она не администратор на этом ПК?') -f $Pc.Host, $Pc.Name, $script:NetUser)
     }
 }
 
@@ -509,7 +543,7 @@ function Read-RegTree($Key, [string]$Rel, $Out) {
             'ExpandString' { [string]$data }
             default       { $null }
         }
-        if ($null -eq $d -and [string]$kind -notin @('String', 'ExpandString')) { Write-Log ('   значение {0}\{1} типа {2} пропущено' -f $Rel, $n, $kind) 'warn'; continue }
+        if ($null -eq $d -and [string]$kind -notin @('String', 'ExpandString')) { Write-Log ((T '   значение {0}\{1} типа {2} пропущено') -f $Rel, $n, $kind) 'warn'; continue }
         $vals.Add([ordered]@{ Name = $n; Kind = [string]$kind; Data = $d })
     }
     $Out.Add([ordered]@{ Path = $Rel; Vals = $vals })
@@ -591,7 +625,7 @@ function Import-CryptoReg($Hklm, $User, [string]$Src) {
         $acl.AddAccessRule($rule)
         $uk.SetAccessControl($acl)
     } catch {
-        $aclNote = 'права сотрудника на ветку реестра не выставлены ({0}); если КриптоПро скажет «Отказано в доступе» (0x80090010), дать сотруднику полный доступ к HKLM\{1} в regedit' -f $_.Exception.Message, $userKeyPath
+        $aclNote = (T 'права сотрудника на ветку реестра не выставлены ({0}); если КриптоПро скажет «Отказано в доступе» (0x80090010), дать сотруднику полный доступ к HKLM\{1} в regedit') -f $_.Exception.Message, $userKeyPath
     } finally { $uk.Close() }
     $base = $Hklm.CreateSubKey($path, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree)
     $added = New-Object System.Collections.Generic.List[string]
@@ -677,39 +711,39 @@ function ConvertFrom-RoboError([string]$E, [string]$Src = '', [string]$Dst = '')
     $worstB = $u8.GetByteCount($worst)
     # путь на NAS внутри шары (без \\сервер\шара), в байтах; на самом NAS к нему добавится ещё /mnt/<пул>/<шара>/
     $nasB = if ($toNas) { $u8.GetByteCount((($o.DstPath -replace '^\\\\[^\\]+\\[^\\]+', '') -replace '\\', '/')) } else { 0 }
-    $isName = if ($worst -eq ($parts | Select-Object -Last 1)) { 'имя файла' } else { 'имя папки' }
+    $isName = if ($worst -eq ($parts | Select-Object -Last 1)) { (T 'имя файла') } else { (T 'имя папки') }
     switch ($o.Code) {
         { $_ -in 3, 123, 206 } {
             if ($toNas -and $worstB -gt 255) {
                 $o.Long = $true
-                $o.Reason = 'имя длиннее 255 байт для NAS'
-                $o.Short = ('{0} {1} знаков = {2} байт, NAS принимает до 255' -f $isName, $worst.Length, $worstB)
-                $o.Text = ('не скопирован: {0} {1} знаков = {2} байт в UTF-8, а NAS (ZFS, ext4) принимает имена не длиннее 255 байт (русская буква = 2 байта, это около 127 букв): {3}' -f $isName, $worst.Length, $worstB, $o.Shown)
+                $o.Reason = (T 'имя длиннее 255 байт для NAS')
+                $o.Short = ((T '{0} {1} знаков = {2} байт, NAS принимает до 255') -f $isName, $worst.Length, $worstB)
+                $o.Text = ((T 'не скопирован: {0} {1} знаков = {2} байт в UTF-8, а NAS (ZFS, ext4) принимает имена не длиннее 255 байт (русская буква = 2 байта, это около 127 букв): {3}') -f $isName, $worst.Length, $worstB, $o.Shown)
             } elseif ($toNas -and $nasB -gt 1000) {
                 $o.Long = $true
-                $o.Reason = 'путь длиннее 1024 байт для NAS'
-                $o.Short = ('путь на NAS около {0} байт, NAS принимает до 1024' -f $nasB)
-                $o.Text = ('не скопирован: путь на NAS около {0} байт в UTF-8, а NAS принимает путь не длиннее 1024 байт (русская буква = 2 байта): {1}' -f $nasB, $o.Shown)
+                $o.Reason = (T 'путь длиннее 1024 байт для NAS')
+                $o.Short = ((T 'путь на NAS около {0} байт, NAS принимает до 1024') -f $nasB)
+                $o.Text = ((T 'не скопирован: путь на NAS около {0} байт в UTF-8, а NAS принимает путь не длиннее 1024 байт (русская буква = 2 байта): {1}') -f $nasB, $o.Shown)
             } elseif (-not $toNas -and $worst.Length -gt 255) {
                 $o.Long = $true
-                $o.Reason = 'имя длиннее 255 знаков'
-                $o.Short = ('{0} {1} знаков, Windows принимает до 255' -f $isName, $worst.Length)
-                $o.Text = ('не скопирован: {0} {1} знаков, а Windows (NTFS) принимает имена не длиннее 255 знаков: {2}' -f $isName, $worst.Length, $o.Shown)
+                $o.Reason = (T 'имя длиннее 255 знаков')
+                $o.Short = ((T '{0} {1} знаков, Windows принимает до 255') -f $isName, $worst.Length)
+                $o.Text = ((T 'не скопирован: {0} {1} знаков, а Windows (NTFS) принимает имена не длиннее 255 знаков: {2}') -f $isName, $worst.Length, $o.Shown)
             } elseif ($_ -eq 3) {
-                $o.Reason = 'путь не найден'
-                $o.Text = ('не скопирован: папка не найдена (переименовали или удалили во время копирования?): {0}' -f $o.Shown)
+                $o.Reason = (T 'путь не найден')
+                $o.Text = ((T 'не скопирован: папка не найдена (переименовали или удалили во время копирования?): {0}') -f $o.Shown)
             } else {
-                $o.Reason = 'недопустимое имя'
-                $o.Text = ('не скопирован: в имени файла или папки недопустимые знаки (например, точка или пробел в конце): {0}' -f $o.Shown)
+                $o.Reason = (T 'недопустимое имя')
+                $o.Text = ((T 'не скопирован: в имени файла или папки недопустимые знаки (например, точка или пробел в конце): {0}') -f $o.Shown)
             }
             break
         }
-        { $_ -in 32, 33 } { $o.Reason = 'файл открыт в программе'; $o.Text = ('не скопирован: файл открыт в программе (Word, Excel и т. п.): {0}' -f $o.Shown); break }
-        5 { $o.Reason = 'нет доступа'; $o.Text = ('не скопирован: нет доступа к файлу: {0}' -f $o.Shown); break }
-        112 { $o.Reason = 'нет места на диске'; $o.Text = ('не скопирован: на диске нет места: {0}' -f $o.Shown); break }
-        2 { $o.Reason = 'файл удалён во время копирования'; $o.Text = ('не скопирован: файл пропал во время копирования: {0}' -f $o.Shown); break }
-        { $_ -in 53, 59, 64, 121, 1231, 1236 } { $o.Reason = 'обрыв сети'; $o.Text = ('не скопирован: оборвалась связь по сети ({0}): {1}' -f $o.Code, $o.Shown); break }
-        default { $o.Reason = ('ошибка {0}' -f $o.Code); $o.Text = $E }
+        { $_ -in 32, 33 } { $o.Reason = (T 'файл открыт в программе'); $o.Text = ((T 'не скопирован: файл открыт в программе (Word, Excel и т. п.): {0}') -f $o.Shown); break }
+        5 { $o.Reason = (T 'нет доступа'); $o.Text = ((T 'не скопирован: нет доступа к файлу: {0}') -f $o.Shown); break }
+        112 { $o.Reason = (T 'нет места на диске'); $o.Text = ((T 'не скопирован: на диске нет места: {0}') -f $o.Shown); break }
+        2 { $o.Reason = (T 'файл удалён во время копирования'); $o.Text = ((T 'не скопирован: файл пропал во время копирования: {0}') -f $o.Shown); break }
+        { $_ -in 53, 59, 64, 121, 1231, 1236 } { $o.Reason = (T 'обрыв сети'); $o.Text = ((T 'не скопирован: оборвалась связь по сети ({0}): {1}') -f $o.Code, $o.Shown); break }
+        default { $o.Reason = ((T 'ошибка {0}') -f $o.Code); $o.Text = $E }
     }
     return $o
 }
@@ -742,7 +776,7 @@ function Update-RoboProgress($St) {
 function Format-Percent($St, [long]$TotalBytes, [long]$TotalFiles) {
     $pct = if ($TotalBytes -gt 0) { [Math]::Floor(100.0 * [Math]::Min($St.Bytes, $TotalBytes) / $TotalBytes) } else { 0 }
     if ($pct -gt 99) { $pct = 99 }   # 100% пишет только итог: последний файл в журнале появляется до конца копирования
-    return ('{0}% ({1} из {2}, файлов {3} из {4})' -f $pct, (Format-Size $St.Bytes), (Format-Size $TotalBytes), [Math]::Min($St.Files, $TotalFiles), $TotalFiles)
+    return ((T '{0}% ({1} из {2}, файлов {3} из {4})') -f $pct, (Format-Size $St.Bytes), (Format-Size $TotalBytes), [Math]::Min($St.Files, $TotalFiles), $TotalFiles)
 }
 
 function Stop-Child($P) {
@@ -762,7 +796,7 @@ function Start-RoboWait([string[]]$RoboArgs, [scriptblock]$OnTick) {
     while (-not $p.HasExited) {
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 150
-        if ($script:Aborting -and -not $script:InCleanup) { Stop-Child $p; throw 'Прервано: окно закрыли' }
+        if ($script:Aborting -and -not $script:InCleanup) { Stop-Child $p; throw (T 'Прервано: окно закрыли') }
         if ($OnTick -and ((Get-Date) - $tick).TotalSeconds -ge 2) { & $OnTick; $tick = Get-Date }
     }
     $p.WaitForExit()
@@ -785,12 +819,12 @@ function Invoke-Robo([string]$Src, [string]$Dst, [string]$Title, [string]$LogPat
         # 1. Подсчёт
         $planLog = $LogPath -replace '\.log$', '.plan.log'
         if ($planLog -eq $LogPath) { $planLog = $LogPath + '.plan' }
-        if ($form) { $form.Text = ('{0}: {1}, считаю файлы…' -f $script:AppTitle, $Title) }
+        if ($form) { $form.Text = ((T '{0}: {1}, считаю файлы…') -f $script:AppTitle, $Title) }
         # Блоки ниже выполняются внутри Start-RoboWait и видят переменные этой функции ($Title, $st, $state…)
         $state = @{ Next = $script:ProgressLogSec }
         [void](Start-RoboWait (@($a) + @('/L', (Format-Arg ('/UNILOG:' + $planLog)))) {
             $el = (Get-Date) - $t0
-            if ($el.TotalSeconds -ge $state.Next) { Write-Log ('   … {0}: считаю файлы, прошло {1}' -f $Title, (Format-Span $el)); $state.Next += $script:ProgressLogSec }
+            if ($el.TotalSeconds -ge $state.Next) { Write-Log ((T '   … {0}: считаю файлы, прошло {1}') -f $Title, (Format-Span $el)); $state.Next += $script:ProgressLogSec }
         })
         $plan = Read-RoboLog $planLog
         try { Remove-Item -LiteralPath $planLog -Force } catch { }
@@ -799,7 +833,7 @@ function Invoke-Robo([string]$Src, [string]$Dst, [string]$Title, [string]$LogPat
         if ($script:SpaceGuard -and $totB -gt 0) {
             $freeG = [PmDisk]::Free($script:SpaceGuard)
             if ($freeG -lt $totB + 512MB) {
-                throw ('Во временной папке {0} свободно {1}, а «{2}» занимает {3}. Освободите место на этом диске или укажите в config.psd1 StagingDir на другом диске' -f $script:SpaceGuard, (Format-Size $freeG), $Title, (Format-Size $totB))
+                throw ((T 'Во временной папке {0} свободно {1}, а «{2}» занимает {3}. Освободите место на этом диске или укажите в config.psd1 StagingDir на другом диске') -f $script:SpaceGuard, (Format-Size $freeG), $Title, (Format-Size $totB))
             }
         }
 
@@ -813,8 +847,8 @@ function Invoke-Robo([string]$Src, [string]$Dst, [string]$Title, [string]$LogPat
             if ($form) { $form.Text = ('{0}: {1} {2}' -f $script:AppTitle, $Title, $(if ($pt) { ($pt -split ' ')[0] } else { '…' })) }
             $el = (Get-Date) - $t1
             if ($el.TotalSeconds -ge $state.Next) {
-                if ($pt) { Write-Log ('   … {0}: {1}, прошло {2}' -f $Title, $pt, (Format-Span $el)) }
-                else { Write-Log ('   … {0}: копирование идёт, прошло {1}' -f $Title, (Format-Span $el)) }
+                if ($pt) { Write-Log ((T '   … {0}: {1}, прошло {2}') -f $Title, $pt, (Format-Span $el)) }
+                else { Write-Log ((T '   … {0}: копирование идёт, прошло {1}') -f $Title, (Format-Span $el)) }
                 $state.Next += $script:ProgressLogSec
             }
         }
@@ -836,19 +870,20 @@ function New-ItemResult([string]$Key, [string]$Status, [string]$Note = '', $Robo
 
 function Write-ItemLog($R, [string[]]$Errors = @()) {
     $lvl = switch ($R.Status) { 'ok' { 'ok' } 'warn' { 'warn' } 'err' { 'err' } default { 'info' } }
-    $mark = switch ($R.Status) { 'ok' { 'готово' } 'warn' { 'с замечаниями' } 'err' { 'ОШИБКА' } 'none' { 'нечего переносить' } 'skip' { 'пропущено' } default { $R.Status } }
-    $txt = '   {0}: {1}' -f $R.Title, $mark
-    if ($R.Files -or $R.Bytes) { $txt += (', файлов {0}, {1}' -f $R.Files, (Format-Size $R.Bytes)) }
+    $mark = switch ($R.Status) { 'ok' { (T 'готово') } 'warn' { (T 'с замечаниями') } 'err' { (T 'ошибка') } 'none' { (T 'нечего переносить') } 'skip' { (T 'пропущено') } default { $R.Status } }
+    $title = if ($script:Titles.Contains([string]$R.Key)) { $script:Titles[[string]$R.Key] } else { [string]$R.Title }   # копия могла быть снята на другом языке
+    $txt = '   {0}: {1}' -f $title, $mark
+    if ($R.Files -or $R.Bytes) { $txt += ((T ', файлов {0}, {1}') -f $R.Files, (Format-Size $R.Bytes)) }
     if ($R.Note) { $txt += ('. ' + $R.Note) }
     Write-Log $txt $lvl
     $n = 0
-    foreach ($e in $Errors) { if ($n -ge 8) { Write-Log ('      … и ещё {0}, полный список в журнале robocopy' -f ($Errors.Count - $n)) 'warn'; break }; Write-Log ('      ' + $e) 'warn'; $n++ }
+    foreach ($e in $Errors) { if ($n -ge 8) { Write-Log ((T '      … и ещё {0}, полный список в журнале robocopy') -f ($Errors.Count - $n)) 'warn'; break }; Write-Log ('      ' + $e) 'warn'; $n++ }
 }
 
 # Одна папка через robocopy: результат в $Results и в журнал окна
 function Invoke-RoboItem([string]$Key, [string]$Src, [string]$Dst, [string]$LogDir, [string[]]$Extra = @(), $Results) {
     if (-not (Test-Path -LiteralPath $Src)) {
-        $r = New-ItemResult $Key 'none' 'папки нет'
+        $r = New-ItemResult $Key 'none' (T 'папки нет')
         $Results.Add($r); Write-ItemLog $r
         return $r
     }
@@ -856,15 +891,15 @@ function Invoke-RoboItem([string]$Key, [string]$Src, [string]$Dst, [string]$LogD
     $robo = Invoke-Robo $Src $Dst $script:Titles[$Key] $log $Extra
     $errs = @($robo.Errors | ForEach-Object { ConvertFrom-RoboError $_ $Src $Dst })
     if ($robo.Code -ge 16) {
-        $r = New-ItemResult $Key 'err' ('robocopy {0}: копирование не выполнено' -f $robo.Code) $robo
+        $r = New-ItemResult $Key 'err' ((T 'robocopy {0}: копирование не выполнено') -f $robo.Code) $robo
     } elseif ($robo.Code -ge 8 -or $robo.Failed -gt 0) {
         # Причины по-русски: «не скопировано 3 файл(ов): слишком длинный путь — 1, файл открыт в программе — 2»
         $why = @($errs | Where-Object { $_.Reason } | Group-Object Reason | ForEach-Object { '{0} — {1}' -f $_.Name, $_.Count })
-        $note = if ($why.Count) { 'не скопировано {0} файл(ов): {1}' -f $robo.Failed, ($why -join ', ') } else { 'не скопировано {0} файл(ов): заняты или нет доступа' -f $robo.Failed }
+        $note = if ($why.Count) { (T 'не скопировано {0} файл(ов): {1}') -f $robo.Failed, ($why -join ', ') } else { (T 'не скопировано {0} файл(ов): заняты или нет доступа') -f $robo.Failed }
         $r = New-ItemResult $Key 'warn' $note $robo
     } else {
         $note = ''
-        if ($robo.Skipped -gt 0) { $note = ('пропущено {0}: уже были на месте или служебные' -f $robo.Skipped) }
+        if ($robo.Skipped -gt 0) { $note = ((T 'пропущено {0}: уже были на месте или служебные') -f $robo.Skipped) }
         $r = New-ItemResult $Key 'ok' $note $robo
     }
     $Results.Add($r)
@@ -872,7 +907,7 @@ function Invoke-RoboItem([string]$Key, [string]$Src, [string]$Dst, [string]$LogD
     $long = @($errs | Where-Object { $_.Long })
     if ($long.Count) {
         foreach ($e in $long) { $script:LongPaths.Add(('{0} ({1})' -f $e.Shown, $e.Short)) }
-        Write-Log '      что сделать: на ПК сотрудника сократить имя (для NAS до ~120 русских букв) и повторить эту часть; или перенести такие файлы вручную' 'warn'
+        Write-Log (T '      что сделать: на ПК сотрудника сократить имя (для NAS до ~120 русских букв) и повторить эту часть; или перенести такие файлы вручную') 'warn'
     }
     return $r
 }
@@ -895,7 +930,7 @@ function Remove-LongDir([string]$Path) {
     $script:InCleanup = $true
     try {
         $log = Join-Path $env:TEMP ('pm-purge-' + [guid]::NewGuid().ToString('N') + '.log')
-        [void](Invoke-Robo $empty $Path 'удаление' $log @('/MIR'))
+        [void](Invoke-Robo $empty $Path (T 'удаление') $log @('/MIR'))
         Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $Path -Recurse -Force
     } finally {
@@ -917,8 +952,8 @@ function New-Staging([string]$Tag) {
 
 function Remove-Staging([string]$Dir) {
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return }
-    try { Remove-LongDir $Dir; Write-Log ('   временная папка {0} стёрта' -f $Dir) }
-    catch { Write-Log ('   временная папка {0} не стёрлась: {1}. Сотрите её вручную: в ней данные сотрудника без шифрования' -f $Dir, $_.Exception.Message) 'warn' }
+    try { Remove-LongDir $Dir; Write-Log ((T '   временная папка {0} стёрта') -f $Dir) }
+    catch { Write-Log ((T '   временная папка {0} не стёрлась: {1}. Сотрите её вручную: в ней данные сотрудника без шифрования') -f $Dir, $_.Exception.Message) 'warn' }
 }
 
 # Временные папки от закрытых окон (-Own: от этого окна) стереть
@@ -931,7 +966,7 @@ function Clear-Staging([switch]$Own) {
         else {
             $p = Get-Process -Id $id -ErrorAction SilentlyContinue
             if ($p -and $p.ProcessName -match 'powershell') { continue }   # то окно ещё открыто
-            Write-Log ('   осталась временная папка от прошлого запуска (окно закрыли во время работы): {0}' -f $d.FullName) 'warn'
+            Write-Log ((T '   осталась временная папка от прошлого запуска (окно закрыли во время работы): {0}') -f $d.FullName) 'warn'
         }
         Remove-Staging $d.FullName
     }
@@ -940,8 +975,8 @@ function Clear-Staging([switch]$Own) {
 # Пароль копии: латиница, цифры, знаки, пробел внутри (ASCII), от 8 знаков. Русские буквы нельзя: 7-Zip читает
 # пароль в кодировке консоли, и на другом ПК тот же пароль мог бы дать другой ключ
 function Test-CopyPassword([string]$P) {
-    if ($P.Length -lt 8) { return 'Пароль: не короче 8 знаков.' }
-    if ($P -cnotmatch '^[\x21-\x7E][\x20-\x7E]*[\x21-\x7E]$') { return 'Пароль: только латинские буквы, цифры и знаки, без русских букв и без пробелов в начале и в конце.' }
+    if ($P.Length -lt 8) { return (T 'Пароль: не короче 8 знаков.') }
+    if ($P -cnotmatch '^[\x21-\x7E][\x20-\x7E]*[\x21-\x7E]$') { return (T 'Пароль: только латинские буквы, цифры и знаки, без русских букв и без пробелов в начале и в конце.') }
     return ''
 }
 
@@ -960,7 +995,7 @@ function Get-7zMessage([string]$Text) {
 function Invoke-7z([string[]]$ZArgs, [string]$Password, [string]$Title) {
     # Если кодировка консоли UTF-8 с BOM, Process пишет BOM в начало stdin, и 7-Zip счёл бы его частью пароля
     try { if ([Console]::InputEncoding.GetPreamble().Length) { [Console]::InputEncoding = New-Object Text.UTF8Encoding($false) } } catch { }
-    if ([Console]::InputEncoding.GetPreamble().Length) { throw 'Пароль не передать в 7-Zip: кодировка консоли UTF-8 с BOM (бета-режим UTF-8 в Windows)' }
+    if ([Console]::InputEncoding.GetPreamble().Length) { throw (T 'Пароль не передать в 7-Zip: кодировка консоли UTF-8 с BOM (бета-режим UTF-8 в Windows)') }
     $all = @($ZArgs[0]) + @('-sccUTF-8', '-bsp1', '-bso1', '-bse1', '-y') + @($ZArgs | Select-Object -Skip 1)
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $script:SevenZip
@@ -1000,13 +1035,13 @@ function Invoke-7z([string[]]$ZArgs, [string]$Password, [string]$Title) {
             }
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 150
-            if ($script:Aborting) { Stop-Child $p; $p = $null; throw 'Прервано: окно закрыли' }
+            if ($script:Aborting) { Stop-Child $p; $p = $null; throw (T 'Прервано: окно закрыли') }
             if (((Get-Date) - $tick).TotalSeconds -ge 2) {
                 $tick = Get-Date
                 $pt = if ($pct -ge 0) { '{0}%' -f $pct } else { '…' }
                 if ($form) { $form.Text = ('{0}: {1} {2}' -f $script:AppTitle, $Title, $pt) }
                 $el = (Get-Date) - $t0
-                if ($el.TotalSeconds -ge $next) { Write-Log ('   … {0}: {1}, прошло {2}' -f $Title, $pt, (Format-Span $el)); $next += $script:ProgressLogSec }
+                if ($el.TotalSeconds -ge $next) { Write-Log ((T '   … {0}: {1}, прошло {2}') -f $Title, $pt, (Format-Span $el)); $next += $script:ProgressLogSec }
             }
         }
         $p.WaitForExit()
@@ -1024,18 +1059,18 @@ function Invoke-7z([string[]]$ZArgs, [string]$Password, [string]$Title) {
 # Сжать и зашифровать собранную копию в архив хранилища (имена файлов тоже шифруются: -mhe=on).
 # Итог строкой «Шифрование» в $Results, возвращает размер архива
 function Compress-Copy([string]$DataDir, [string]$Archive, [string]$Password, $Results) {
-    Write-Log ('   шифрую копию в {0}' -f $Archive)
-    $z = Invoke-7z @('a', '-t7z', '-mx=1', '-mmt=on', '-mhe=on', '-p', '--', $Archive, (Join-Path $DataDir '*')) $Password 'шифрование'
+    Write-Log ((T '   шифрую копию в {0}') -f $Archive)
+    $z = Invoke-7z @('a', '-t7z', '-mx=1', '-mmt=on', '-mhe=on', '-p', '--', $Archive, (Join-Path $DataDir '*')) $Password (T 'шифрование')
     $size = 0L
     try { $size = [long](Get-Item -LiteralPath $Archive -ErrorAction Stop).Length } catch { }
     if ($z.Code -ge 2) {
         try { Remove-Item -LiteralPath $Archive -Force -ErrorAction Stop } catch { }
         $size = 0L
-        $r = New-ItemResult 'Archive' 'err' ('7-Zip не создал архив (код {0}): {1}' -f $z.Code, (Get-7zMessage $z.Output))
+        $r = New-ItemResult 'Archive' 'err' ((T '7-Zip не создал архив (код {0}): {1}') -f $z.Code, (Get-7zMessage $z.Output))
     } elseif ($z.Code -eq 1) {
-        $r = New-ItemResult 'Archive' 'warn' ('архив {0}; 7-Zip предупредил: {1}' -f (Format-Size $size), (Get-7zMessage $z.Output))
+        $r = New-ItemResult 'Archive' 'warn' ((T 'архив {0}; 7-Zip предупредил: {1}') -f (Format-Size $size), (Get-7zMessage $z.Output))
     } else {
-        $r = New-ItemResult 'Archive' 'ok' ('архив {0}, за {1}' -f (Format-Size $size), (Format-Span $z.Time))
+        $r = New-ItemResult 'Archive' 'ok' ((T 'архив {0}, за {1}') -f (Format-Size $size), (Format-Span $z.Time))
     }
     $Results.Add($r); Write-ItemLog $r
     return $size
@@ -1044,23 +1079,23 @@ function Compress-Copy([string]$DataDir, [string]$Archive, [string]$Password, $R
 # Проверить пароль копии: у архива зашифрованы и имена файлов, без пароля 7-Zip не прочитает даже список.
 # Пусто: пароль подошёл, иначе текст ошибки
 function Test-ArchivePassword([string]$Archive, [string]$Password) {
-    if (-not (Test-Path -LiteralPath $Archive)) { return ('В копии нет архива {0}: копия неполная.' -f $Archive) }
-    $z = Invoke-7z @('l', '--', $Archive) $Password 'проверка пароля'
+    if (-not (Test-Path -LiteralPath $Archive)) { return ((T 'В копии нет архива {0}: копия неполная.') -f $Archive) }
+    $z = Invoke-7z @('l', '--', $Archive) $Password (T 'проверка пароля')
     if ($z.Code -eq 0) { return '' }
-    if ($z.Output -match '(?i)wrong password|encrypted archive') { return 'Неверный пароль копии.' }
-    return ('7-Zip не открыл архив копии (код {0}): {1}' -f $z.Code, (Get-7zMessage $z.Output))
+    if ($z.Output -match '(?i)wrong password|encrypted archive') { return (T 'Неверный пароль копии.') }
+    return ((T '7-Zip не открыл архив копии (код {0}): {1}') -f $z.Code, (Get-7zMessage $z.Output))
 }
 
 function Expand-Copy([string]$Archive, [string]$DataDir, [string]$Password) {
-    if (-not (Test-Path -LiteralPath $Archive)) { throw ('В копии нет архива {0}: копия неполная' -f $Archive) }
-    Write-Log ('   расшифровываю копию во временную папку {0}' -f $DataDir)
-    $z = Invoke-7z @('x', ('-o' + $DataDir), '--', $Archive) $Password 'расшифровка'
+    if (-not (Test-Path -LiteralPath $Archive)) { throw ((T 'В копии нет архива {0}: копия неполная') -f $Archive) }
+    Write-Log ((T '   расшифровываю копию во временную папку {0}') -f $DataDir)
+    $z = Invoke-7z @('x', ('-o' + $DataDir), '--', $Archive) $Password (T 'расшифровка')
     if ($z.Code -ge 2) {
-        if ($z.Output -match '(?i)wrong password') { throw 'Неверный пароль копии' }
-        throw ('7-Zip не распаковал копию (код {0}): {1}' -f $z.Code, (Get-7zMessage $z.Output))
+        if ($z.Output -match '(?i)wrong password') { throw (T 'Неверный пароль копии') }
+        throw ((T '7-Zip не распаковал копию (код {0}): {1}') -f $z.Code, (Get-7zMessage $z.Output))
     }
-    if ($z.Code -eq 1) { Write-Log ('   7-Zip предупредил: {0}' -f (Get-7zMessage $z.Output)) 'warn' }
-    else { Write-Log ('   расшифровано за {0}' -f (Format-Span $z.Time)) }
+    if ($z.Code -eq 1) { Write-Log ((T '   7-Zip предупредил: {0}') -f (Get-7zMessage $z.Output)) 'warn' }
+    else { Write-Log ((T '   расшифровано за {0}') -f (Format-Span $z.Time)) }
 }
 
 # ---------------------------------------------------------------- копии в хранилище (StoreRoot)
@@ -1078,9 +1113,9 @@ function Read-Manifest([string]$Dir) {
 function Test-Store {
     if (-not (Test-Path -LiteralPath $script:Cfg.StoreRoot)) {
         if ($script:Cfg.StoreRoot -like '\\*') {
-            throw ('Нет доступа к {0} под учёткой {1}. Есть ли эта шара (StoreRoot в config.psd1) и есть ли у учётки доступ к ней?' -f $script:Cfg.StoreRoot, $script:NetUser)
+            throw ((T 'Нет доступа к {0} под учёткой {1}. Есть ли эта шара (StoreRoot в config.psd1) и есть ли у учётки доступ к ней?') -f $script:Cfg.StoreRoot, $script:NetUser)
         }
-        throw ('Нет папки {0} (StoreRoot в config.psd1): создайте её (см. README, «Подготовка хранилища») или поправьте путь. USB-диск подключён?' -f $script:Cfg.StoreRoot)
+        throw ((T 'Нет папки {0} (StoreRoot в config.psd1): создайте её (см. README, «Подготовка хранилища») или поправьте путь. USB-диск подключён?') -f $script:Cfg.StoreRoot)
     }
 }
 
@@ -1093,15 +1128,15 @@ function Get-Copies {
             $pcName = $Matches[3]
             $when = [datetime]::ParseExact(($Matches[1] + ' ' + $Matches[2]), 'yyyy-MM-dd HHmm', $null)
             $m = Read-Manifest $cd.FullName
-            $status = 'нет manifest.json'
+            $status = (T 'нет manifest.json')
             $name = ''; $size = 0; $restored = ''
             if ($m) {
                 $name = [string]$m.Name
                 $size = [long]$m.Bytes
-                $status = switch ([string]$m.Status) { 'ok' { 'готово' } 'warn' { 'с замечаниями' } 'err' { 'с ошибками' } 'running' { 'прервано' } default { [string]$m.Status } }
-                if ($m.Encrypted) { $status += ', зашифрована' }
+                $status = switch ([string]$m.Status) { 'ok' { (T 'готово') } 'warn' { (T 'с замечаниями') } 'err' { (T 'с ошибками') } 'running' { (T 'прервано') } default { [string]$m.Status } }
+                if ($m.Encrypted) { $status += (T ', зашифрована') }
                 $last = @($m.Restores) | Where-Object { $_ } | Select-Object -Last 1
-                if ($last) { $restored = '{0}, {1}' -f $last.PC, ([datetime]$last.Date).ToString('dd.MM HH:mm') }
+                if ($last) { $restored = '{0}, {1}' -f $last.PC, ([datetime]$last.Date).ToString($script:ShortFmt) }
             }
             $list.Add([pscustomobject]@{ Login = $ud.Name; Name = $name; Pc = $pcName; When = $when; Bytes = $size; Status = $status; Restored = $restored; Path = $cd.FullName; Manifest = $m; Encrypted = [bool]($m -and $m.Encrypted) })
         }
@@ -1114,12 +1149,12 @@ function Update-Grid {
     $g = $script:Grid
     $g.Rows.Clear()
     foreach ($c in $script:Copies) {
-        $i = $g.Rows.Add($c.Login, $c.Name, $c.Pc, $c.When.ToString('dd.MM.yyyy HH:mm'), (Format-Size $c.Bytes), $c.Status, $c.Restored)
+        $i = $g.Rows.Add($c.Login, $c.Name, $c.Pc, $c.When.ToString($script:DateFmt), (Format-Size $c.Bytes), $c.Status, $c.Restored)
         $g.Rows[$i].Tag = $c.Path
     }
     $free = ''
-    try { $free = ', свободно ' + (Format-Size ([PmDisk]::Free($script:Cfg.StoreRoot))) } catch { }
-    $script:InfoLabel.Text = ('Копии: {0}{1}. Всего копий: {2}. К ПК и хранилищу окно ходит под {3}' -f $script:Cfg.StoreRoot, $free, $script:Copies.Count, $script:NetUser)
+    try { $free = (T ', свободно ') + (Format-Size ([PmDisk]::Free($script:Cfg.StoreRoot))) } catch { }
+    $script:InfoLabel.Text = ((T 'Копии: {0}{1}. Всего копий: {2}. К ПК и хранилищу окно ходит под {3}') -f $script:Cfg.StoreRoot, $free, $script:Copies.Count, $script:NetUser)
 }
 
 function Get-SelectedCopy {
@@ -1130,23 +1165,23 @@ function Get-SelectedCopy {
 }
 
 function Remove-Copy($C) {
-    Write-Log ('=== Удаление копии {0} ({1})' -f $C.Path, (Format-Size $C.Bytes)) 'head'
+    Write-Log ((T '=== Удаление копии {0} ({1})') -f $C.Path, (Format-Size $C.Bytes)) 'head'
     Remove-LongDir $C.Path
     $parent = Split-Path $C.Path -Parent
     if (-not @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue).Count) { Remove-Item -LiteralPath $parent -Force }
-    Write-Log '   удалена' 'ok'
+    Write-Log (T '   удалена') 'ok'
 }
 
 function Invoke-Cleanup {
     $days = [int]$script:Cfg.RetentionDays
     $old = @($script:Copies | Where-Object { $_.When -lt (Get-Date).AddDays(-$days) })
     if (-not $old.Count) { return }
-    $txt = ($old | Select-Object -First 15 | ForEach-Object { '{0} {1} с {2}, {3}' -f $_.When.ToString('dd.MM.yyyy'), $_.Login, $_.Pc, (Format-Size $_.Bytes) }) -join "`r`n"
+    $txt = ($old | Select-Object -First 15 | ForEach-Object { (T '{0} {1} с {2}, {3}') -f $_.When.ToString($script:DayFmt), $_.Login, $_.Pc, (Format-Size $_.Bytes) }) -join "`r`n"
     if ($old.Count -gt 15) { $txt += "`r`n…" }
-    $q = 'В хранилище {0} копий старше {1} дней:{2}{2}{3}{2}{2}В копиях лежат пароли браузера и подписи сотрудников. Удалить их?' -f $old.Count, $days, "`r`n", $txt
+    $q = (T 'В хранилище {0} копий старше {1} дней:{2}{2}{3}{2}{2}В копиях лежат пароли браузера и подписи сотрудников. Удалить их?') -f $old.Count, $days, "`r`n", $txt
     if ((Show-Msg $q 'Question' 'YesNo') -ne 'Yes') { return }
     foreach ($c in $old) {
-        try { Remove-Copy $c } catch { Write-Log ('   не удалось удалить {0}: {1}' -f $c.Path, $_.Exception.Message) 'err' }
+        try { Remove-Copy $c } catch { Write-Log ((T '   не удалось удалить {0}: {1}') -f $c.Path, $_.Exception.Message) 'err' }
     }
     Update-Grid
 }
@@ -1155,7 +1190,7 @@ function Invoke-Cleanup {
 
 function Wait-BrowserClosed($B, [string]$UserData, [string]$PcName) {
     while (Test-BrowserRunning $B $UserData) {
-        $a = Show-Msg ('У сотрудника на {0} открыт {1}. Пока он открыт, профиль браузера не скопировать.{2}{2}Попросите закрыть браузер и нажмите «Повторить». «Отмена»: перенести всё остальное без этого браузера.' -f $PcName, $B.Title, "`r`n") 'Warning' 'RetryCancel'
+        $a = Show-Msg ((T 'У сотрудника на {0} открыт {1}. Пока он открыт, профиль браузера не скопировать.{2}{2}Попросите закрыть браузер и нажмите «Повторить». «Отмена»: перенести всё остальное без этого браузера.') -f $PcName, $B.Title, "`r`n") 'Warning' 'RetryCancel'
         if ($a -ne 'Retry') { return $false }
     }
     return $true
@@ -1193,12 +1228,12 @@ function Get-BrowserJobs($Prof, $Pc, [string[]]$Groups, $Manifest, $Results) {
             if (-not $rel) { $rel = $b.UserData[0] }   # копии до версии 1.4
         } else {
             foreach ($c in $b.UserData) { if (Test-Path -LiteralPath (Join-Path $Prof.Unc $c)) { $rel = $c; break } }
-            if (-not $rel) { $r = New-ItemResult $b.Key 'none' 'на этом ПК его нет'; $Results.Add($r); Write-ItemLog $r; continue }
+            if (-not $rel) { $r = New-ItemResult $b.Key 'none' (T 'на этом ПК его нет'); $Results.Add($r); Write-ItemLog $r; continue }
         }
         $ud = Join-Path $Prof.Unc $rel
         if (-not (Wait-BrowserClosed $b $ud $Pc.Name)) {
-            $Results.Add((New-ItemResult $b.Key 'skip' 'браузер был открыт'))
-            Write-Log ('   {0} пропущен: открыт у сотрудника' -f $b.Title) 'warn'
+            $Results.Add((New-ItemResult $b.Key 'skip' (T 'браузер был открыт')))
+            Write-Log ((T '   {0} пропущен: открыт у сотрудника') -f $b.Title) 'warn'
             continue
         }
         $jobs.Add([pscustomobject]@{ B = $b; Rel = $rel; Ud = $ud })
@@ -1210,11 +1245,11 @@ function Get-LongPathText {
     $l = $script:LongPaths
     if (-not $l.Count) { return '' }
     $n = "`r`n"
-    $t = 'Не скопированы из-за слишком длинного имени, {0} шт.:{1}' -f $l.Count, $n
+    $t = (T 'Не скопированы из-за слишком длинного имени, {0} шт.:{1}') -f $l.Count, $n
     foreach ($p in ($l | Select-Object -First 5)) { $t += ('• {0}{1}' -f $p, $n) }
-    if ($l.Count -gt 5) { $t += ('• … и ещё {0}, все в журнале окна{1}' -f ($l.Count - 5), $n) }
-    $t += 'NAS на Linux (ZFS, ext4) принимает имя файла или папки до 255 байт: русская буква занимает 2 байта, это около 127 букв. '
-    $t += 'Сократите имя на ПК сотрудника и повторите, или перенесите эти файлы вручную.' + $n + $n
+    if ($l.Count -gt 5) { $t += ((T '• … и ещё {0}, все в журнале окна{1}') -f ($l.Count - 5), $n) }
+    $t += (T 'NAS на Linux (ZFS, ext4) принимает имя файла или папки до 255 байт: русская буква занимает 2 байта, это около 127 букв. ')
+    $t += (T 'Сократите имя на ПК сотрудника и повторите, или перенесите эти файлы вручную.') + $n + $n
     return $t
 }
 
@@ -1225,29 +1260,29 @@ function Get-LongPathText {
 function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Resolved = $null, [string]$Password = '', [switch]$KeepData) {
     $t0 = Get-Date
     $script:LongPaths.Clear()
-    Write-Log ('=== Снять с ПК: {0} с {1}' -f $Login, $PcName) 'head'
+    Write-Log ((T '=== Снять с ПК: {0} с {1}') -f $Login, $PcName) 'head'
     $user = Get-PmUser $Login
-    Write-Log ('   сотрудник: {0} ({1}), SID {2}{3}' -f $user.Name, $user.Login, $user.Sid, $(if (-not $user.Enabled) { ', учётка ОТКЛЮЧЕНА' } else { '' }))
+    Write-Log ((T '   сотрудник: {0} ({1}), SID {2}{3}') -f $user.Name, $user.Login, $user.Sid, $(if (-not $user.Enabled) { (T ', учётка ОТКЛЮЧЕНА') } else { '' }))
     Test-Store
     $free = [PmDisk]::Free($script:Cfg.StoreRoot)
-    if ($free -lt [long]$script:Cfg.MinNasFreeGB * 1GB) { throw ('В хранилище копий свободно {0}, нужно хотя бы {1} ГБ' -f (Format-Size $free), $script:Cfg.MinNasFreeGB) }
+    if ($free -lt [long]$script:Cfg.MinNasFreeGB * 1GB) { throw ((T 'В хранилище копий свободно {0}, нужно хотя бы {1} ГБ') -f (Format-Size $free), $script:Cfg.MinNasFreeGB) }
     if ($Resolved) { $pc = $Resolved }
     else {
         $pc = Resolve-Pc $PcName
         Test-PcAccess $pc
     }
-    Write-Log ('   ПК {0} ({1}) {2}: доступ есть' -f $pc.Name, $pc.Host, $pc.Os)
+    Write-Log ((T '   ПК {0} ({1}) {2}: доступ есть') -f $pc.Name, $pc.Host, $pc.Os)
 
     $results = New-Object System.Collections.Generic.List[object]
     $dir = $null; $m = $null; $stage = $null; $done = $false
     try {
         $prof = Find-UserProfile $pc $user
-        if (-not $prof.Unc) { throw ('На {0} нет профиля {1}: сотрудник на этом ПК не работал?' -f $pc.Name, $user.Login) }
-        Write-Log ('   профиль: {0}{1}' -f $prof.Local, $(if ($prof.ByRegistry) { ' (по реестру)' } else { ' (по имени папки)' }))
+        if (-not $prof.Unc) { throw ((T 'На {0} нет профиля {1}: сотрудник на этом ПК не работал?') -f $pc.Name, $user.Login) }
+        Write-Log ((T '   профиль: {0}{1}') -f $prof.Local, $(if ($prof.ByRegistry) { (T ' (по реестру)') } else { (T ' (по имени папки)') }))
         if ($prof.Loaded) {
-            $q = 'Сотрудник сейчас в Windows на {0} (или профиль ещё не выгружен). Открытые у него файлы не скопируются.{1}{1}Лучше попросить его сохранить всё и выйти из Windows. Продолжить сейчас?' -f $pc.Name, "`r`n"
-            if ((Show-Msg $q 'Warning' 'YesNo') -ne 'Yes') { throw 'Отменено: сотрудник в Windows' }
-            Write-Log '   сотрудник в Windows: открытые файлы могут не скопироваться' 'warn'
+            $q = (T 'Сотрудник сейчас в Windows на {0} (или профиль ещё не выгружен). Открытые у него файлы не скопируются.{1}{1}Лучше попросить его сохранить всё и выйти из Windows. Продолжить сейчас?') -f $pc.Name, "`r`n"
+            if ((Show-Msg $q 'Warning' 'YesNo') -ne 'Yes') { throw (T 'Отменено: сотрудник в Windows') }
+            Write-Log (T '   сотрудник в Windows: открытые файлы могут не скопироваться') 'warn'
         }
 
         $bJobs = Get-BrowserJobs $prof $pc $Groups $null $results
@@ -1266,13 +1301,13 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Res
         $m = [ordered]@{
             Tool = $script:Version; Login = $user.Login; Name = $user.Name; Sid = $user.Sid
             SourcePC = $pc.Name; SourceProfile = $prof.Local; Created = (Get-Date).ToString('s'); Finished = $null
-            Operator = ('{0} (окно: {1}\{2} на {3})' -f $script:NetUser, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME)
+            Operator = ((T '{0} (окно: {1}\{2} на {3})') -f $script:NetUser, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME)
             Status = 'running'; Bytes = 0; Encrypted = [bool]$Password; Archive = $(if ($Password) { 'data.7z' } else { '' }); ArchiveBytes = 0
             Items = $results; Restores = @()
         }
         Save-Manifest $dir $m
-        Write-Log ('   копия: {0}' -f $dir)
-        if ($Password) { Write-Log ('   копия будет зашифрована (7-Zip, AES-256), пока собираю её во временной папке {0}' -f $stage) }
+        Write-Log ((T '   копия: {0}') -f $dir)
+        if ($Password) { Write-Log ((T '   копия будет зашифрована (7-Zip, AES-256), пока собираю её во временной папке {0}') -f $stage) }
 
         $fx = @(Get-ExcludeArgs @() $script:Cfg.FileExcludes)
         $base = @('/E', '/COPY:DAT', '/DCOPY:T')
@@ -1289,10 +1324,10 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Res
             if ($prof.Hklm) {
                 try {
                     $cr = Export-CryptoReg $prof.Hklm $user (Join-Path $data 'CryptoPro-Reg')
-                    if ($cr.Count) { $r = New-ItemResult 'CryptoReg' 'ok' ('контейнеров {0}: {1}' -f $cr.Count, ($cr.Names -join ', ')) }
-                    else { $r = New-ItemResult 'CryptoReg' 'none' 'контейнеров нет' }
+                    if ($cr.Count) { $r = New-ItemResult 'CryptoReg' 'ok' ((T 'контейнеров {0}: {1}') -f $cr.Count, ($cr.Names -join ', ')) }
+                    else { $r = New-ItemResult 'CryptoReg' 'none' (T 'контейнеров нет') }
                 } catch { $r = New-ItemResult 'CryptoReg' 'err' $_.Exception.Message }
-            } else { $r = New-ItemResult 'CryptoReg' 'warn' 'реестр ПК недоступен, контейнеры из реестра не сняты' }
+            } else { $r = New-ItemResult 'CryptoReg' 'warn' (T 'реестр ПК недоступен, контейнеры из реестра не сняты') }
             $results.Add($r); Write-ItemLog $r
             [void](Invoke-RoboItem 'CryptoDir' (Join-Path $prof.Unc $script:Cfg.CryptoProDir) (Join-Path $data 'CryptoPro-Dir') $logs $base $results)
             [void](Invoke-RoboItem 'CertsMy' (Join-Path $prof.Unc $script:Cfg.CertsMyPath) (Join-Path $data 'Certs-My') $logs $base $results)
@@ -1321,16 +1356,16 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Res
             $m.Status = if ($done) { Get-Worst $results } else { 'err' }
             $sum = 0L; foreach ($i in $results) { $sum += [long]$i.Bytes }; $m.Bytes = $sum
             $m.Finished = (Get-Date).ToString('s')
-            try { Save-Manifest $dir $m } catch { Write-Log ('   manifest.json не записан: ' + $_.Exception.Message) 'err' }
+            try { Save-Manifest $dir $m } catch { Write-Log ((T '   manifest.json не записан: ') + $_.Exception.Message) 'err' }
         }
         try { Update-Grid } catch { }
     }
 
     $st = Get-Worst $results
     $lvl = if ($st -eq 'ok') { 'ok' } else { 'warn' }
-    Write-Log ('=== Снято: {0}, {1}, за {2}{3}' -f $user.Login, (Format-Size $m.Bytes), (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { '. Есть замечания, см. выше' } else { '' })) $lvl
-    $head = 'Копия снята: {0} ({1}) с {2}, {3}.' -f $user.Name, $user.Login, $pc.Name, (Format-Size $m.Bytes)
-    if ($Password) { $head += ' ' + 'Копия зашифрована паролем: без него её не развернуть.' }
+    Write-Log ((T '=== Снято: {0}, {1}, за {2}{3}') -f $user.Login, (Format-Size $m.Bytes), (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { (T '. Есть замечания, см. выше') } else { '' })) $lvl
+    $head = (T 'Копия снята: {0} ({1}) с {2}, {3}.') -f $user.Name, $user.Login, $pc.Name, (Format-Size $m.Bytes)
+    if ($Password) { $head += ' ' + (T 'Копия зашифрована паролем: без него её не развернуть.') }
     return [pscustomobject]@{
         Path      = $dir
         DataDir   = $(if ($stage) { $stage } else { $dir })
@@ -1357,17 +1392,17 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
     $t0 = Get-Date
     $script:LongPaths.Clear()
     $m = Read-Manifest $Copy.Path
-    if (-not $m) { throw ('В копии {0} нет manifest.json: копия неполная' -f $Copy.Path) }
-    Write-Log ('=== Развернуть на ПК: {0} ({1}) из копии {2} с {3} → {4}' -f $m.Login, $m.Name, ([datetime]$m.Created).ToString('dd.MM.yyyy HH:mm'), $m.SourcePC, $PcName) 'head'
-    if ($m.Status -eq 'running') { Write-Log '   копия была прервана: развернётся то, что успело скопироваться' 'warn' }
+    if (-not $m) { throw ((T 'В копии {0} нет manifest.json: копия неполная') -f $Copy.Path) }
+    Write-Log ((T '=== Развернуть на ПК: {0} ({1}) из копии {2} с {3} → {4}') -f $m.Login, $m.Name, ([datetime]$m.Created).ToString($script:DateFmt), $m.SourcePC, $PcName) 'head'
+    if ($m.Status -eq 'running') { Write-Log (T '   копия была прервана: развернётся то, что успело скопироваться') 'warn' }
     $user = Get-PmUser ([string]$m.Login)
-    if ($user.Sid -ne [string]$m.Sid) { throw ('SID сотрудника в AD ({0}) не совпадает с копией ({1}): учётку пересоздавали? Пароли браузера так не перенести' -f $user.Sid, $m.Sid) }
+    if ($user.Sid -ne [string]$m.Sid) { throw ((T 'SID сотрудника в AD ({0}) не совпадает с копией ({1}): учётку пересоздавали? Пароли браузера так не перенести') -f $user.Sid, $m.Sid) }
     if ($Resolved) { $pc = $Resolved }
     else {
         $pc = Resolve-Pc $PcName
         Test-PcAccess $pc
     }
-    Write-Log ('   ПК {0} ({1}) {2}: доступ есть' -f $pc.Name, $pc.Host, $pc.Os)
+    Write-Log ((T '   ПК {0} ({1}) {2}: доступ есть') -f $pc.Name, $pc.Host, $pc.Os)
 
     $results = New-Object System.Collections.Generic.List[object]
     $copyDir = $Copy.Path
@@ -1376,8 +1411,8 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
     $stamp = Get-Stamp
     try {
         $prof = Find-UserProfile $pc $user
-        if (-not $prof.Unc) { throw ('Сотрудник ещё не входил на {0}: профиля нет. Пусть войдёт в Windows один раз, потом снова «Развернуть»' -f $pc.Name) }
-        Write-Log ('   профиль: {0}{1}{2}' -f $prof.Local, $(if ($prof.ByRegistry) { ' (по реестру)' } else { ' (по имени папки)' }), $(if ($prof.Loaded) { ', сотрудник сейчас в Windows' } else { '' }))
+        if (-not $prof.Unc) { throw ((T 'Сотрудник ещё не входил на {0}: профиля нет. Пусть войдёт в Windows один раз, потом снова «Развернуть»') -f $pc.Name) }
+        Write-Log ((T '   профиль: {0}{1}{2}') -f $prof.Local, $(if ($prof.ByRegistry) { (T ' (по реестру)') } else { (T ' (по имени папки)') }), $(if ($prof.Loaded) { (T ', сотрудник сейчас в Windows') } else { '' }))
 
         # Место на диске нового ПК
         $need = 0L
@@ -1388,20 +1423,20 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
         $drive = ($prof.Local.Substring(0, 1)).ToUpper()
         $freeT = [PmDisk]::Free(('\\{0}\{1}$\' -f $pc.Host, $drive))
         if ($freeT -lt $need + [long]$script:Cfg.TargetSpareGB * 1GB) {
-            throw ('На {0} диск {1}: свободно {2}, а переносим {3} (+{4} ГБ запаса)' -f $pc.Name, $drive, (Format-Size $freeT), (Format-Size $need), $script:Cfg.TargetSpareGB)
+            throw ((T 'На {0} диск {1}: свободно {2}, а переносим {3} (+{4} ГБ запаса)') -f $pc.Name, $drive, (Format-Size $freeT), (Format-Size $need), $script:Cfg.TargetSpareGB)
         }
-        Write-Log ('   на диске {0}: свободно {1}, переносим {2}' -f $drive, (Format-Size $freeT), (Format-Size $need))
+        Write-Log ((T '   на диске {0}: свободно {1}, переносим {2}') -f $drive, (Format-Size $freeT), (Format-Size $need))
 
         # Зашифрованная копия: расшифровать во временную папку на этом ПК (у «Перенести сразу» она уже там).
         # До проверки браузеров: расшифровка долгая, а браузер сотрудник может открыть в любой момент
         if ($DataDir) { $src = $DataDir }
         elseif ($m.Encrypted) {
-            if (-not $script:SevenZip) { throw 'Копия зашифрована, а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip в config.psd1' }
-            if (-not $Password) { throw 'Копия зашифрована: нужен её пароль' }
+            if (-not $script:SevenZip) { throw (T 'Копия зашифрована, а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip в config.psd1') }
+            if (-not $Password) { throw (T 'Копия зашифрована: нужен её пароль') }
             $stage = New-Staging $user.Login
             $freeS = [PmDisk]::Free($stage)
             if ($freeS -lt [long]$m.Bytes + 1GB) {
-                throw ('Для расшифровки нужно {0} во временной папке {1}, а там свободно {2}. Освободите место или укажите в config.psd1 StagingDir на другом диске' -f (Format-Size ([long]$m.Bytes + 1GB)), $stage, (Format-Size $freeS))
+                throw ((T 'Для расшифровки нужно {0} во временной папке {1}, а там свободно {2}. Освободите место или укажите в config.psd1 StagingDir на другом диске') -f (Format-Size ([long]$m.Bytes + 1GB)), $stage, (Format-Size $freeS))
             }
             Expand-Copy (Join-Path $copyDir ([string]$m.Archive)) $stage $Password
             $src = $stage
@@ -1427,13 +1462,13 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
                 if ($prof.Hklm) {
                     try {
                         $ir = Import-CryptoReg $prof.Hklm $user (Join-Path $src 'CryptoPro-Reg')
-                        $note = 'добавлено {0}' -f $ir.Added.Count
+                        $note = (T 'добавлено {0}') -f $ir.Added.Count
                         if ($ir.Added.Count) { $note += (': ' + ($ir.Added -join ', ')) }
-                        if ($ir.Skipped.Count) { $note += ('; уже были на ПК, не трогал: ' + ($ir.Skipped -join ', ')) }
+                        if ($ir.Skipped.Count) { $note += ((T '; уже были на ПК, не трогал: ') + ($ir.Skipped -join ', ')) }
                         if ($ir.AclNote) { $note += ('; ' + $ir.AclNote) }
                         $r = New-ItemResult 'CryptoReg' $(if ($ir.Skipped.Count -or $ir.AclNote) { 'warn' } else { 'ok' }) $note
                     } catch { $r = New-ItemResult 'CryptoReg' 'err' $_.Exception.Message }
-                } else { $r = New-ItemResult 'CryptoReg' 'err' 'реестр ПК недоступен. Можно импортировать руками CryptoPro-Reg\keys.reg на новом ПК от администратора' }
+                } else { $r = New-ItemResult 'CryptoReg' 'err' (T 'реестр ПК недоступен. Можно импортировать руками CryptoPro-Reg\keys.reg на новом ПК от администратора') }
                 $results.Add($r); Write-ItemLog $r
             }
             foreach ($pair in @(@('CryptoDir', 'CryptoPro-Dir', $script:Cfg.CryptoProDir), @('CertsMy', 'Certs-My', $script:Cfg.CertsMyPath), @('CertsCrypto', 'Certs-Crypto', $script:Cfg.CertsCryptoPath))) {
@@ -1442,7 +1477,7 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
             }
             $hasCp = Test-Path -LiteralPath (ConvertTo-Unc $pc.Host $script:Cfg.CryptoProPc)
             if (-not $hasCp -and ((Get-CopyHas $m 'CryptoReg') -or (Get-CopyHas $m 'CryptoDir'))) {
-                Write-Log ('   на {0} не найден КриптоПро CSP ({1}): контейнеры на месте, но без КриптоПро и его лицензии подпись не заработает' -f $pc.Name, $script:Cfg.CryptoProPc) 'warn'
+                Write-Log ((T '   на {0} не найден КриптоПро CSP ({1}): контейнеры на месте, но без КриптоПро и его лицензии подпись не заработает') -f $pc.Name, $script:Cfg.CryptoProPc) 'warn'
             }
         }
         # 3. Браузеры: прежний профиль нового ПК (если был) в сторону, на его место профиль из копии
@@ -1455,14 +1490,14 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
                 try { Rename-Item -LiteralPath $ud -NewName $bakName; $moved = $bakName }
                 catch {
                     $ok = $false
-                    $r = New-ItemResult $b.Key 'err' ('не удалось убрать в сторону прежний профиль браузера на новом ПК (занят?): ' + $_.Exception.Message)
+                    $r = New-ItemResult $b.Key 'err' ((T 'не удалось убрать в сторону прежний профиль браузера на новом ПК (занят?): ') + $_.Exception.Message)
                     $results.Add($r); Write-ItemLog $r
                 }
             }
             if ($ok) {
                 $r = Invoke-RoboItem $b.Key (Join-Path $src $b.Key) $ud $logs $base $results
                 $r.Src = $j.Rel
-                if ($moved) { $r.Note = (($r.Note, ('прежний профиль браузера нового ПК лежит рядом: ' + $moved)) | Where-Object { $_ }) -join '; '; Write-Log ('      прежний профиль браузера на ПК переименован в «{0}»' -f $moved) }
+                if ($moved) { $r.Note = (($r.Note, ((T 'прежний профиль браузера нового ПК лежит рядом: ') + $moved)) | Where-Object { $_ }) -join '; '; Write-Log ((T '      прежний профиль браузера на ПК переименован в «{0}»') -f $moved) }
             }
             if ($b.Exe.Count) {
                 $exe = $false
@@ -1470,7 +1505,7 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
                     $p = if ($e -match '^[A-Za-z]:\\') { ConvertTo-Unc $pc.Host $e } else { Join-Path $prof.Unc $e }
                     if (Test-Path -LiteralPath $p) { $exe = $true; break }
                 }
-                if (-not $exe) { Write-Log ('   на {0} не найден {1}: установите его, профиль уже на месте' -f $pc.Name, $b.Title) 'warn' }
+                if (-not $exe) { Write-Log ((T '   на {0} не найден {1}: установите его, профиль уже на месте') -f $pc.Name, $b.Title) 'warn' }
             }
         }
         # 4. Папки: файлы, которые на новом ПК новее, не перезаписываем
@@ -1490,41 +1525,41 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
                 if ($m2.PSObject.Properties['Restores']) { $m2.Restores = $all } else { $m2 | Add-Member -NotePropertyName Restores -NotePropertyValue $all }
                 Save-Manifest $copyDir $m2
             }
-        } catch { Write-Log ('   запись о развёртывании в manifest.json не сохранена: ' + $_.Exception.Message) 'warn' }
+        } catch { Write-Log ((T '   запись о развёртывании в manifest.json не сохранена: ') + $_.Exception.Message) 'warn' }
         try { Update-Grid } catch { }
     }
     $act = ''
     if ($script:Cfg.Act) {
-        try { $act = New-Act $m $rec; Write-Log ('   акт переноса: {0}' -f $act) }
-        catch { Write-Log ('   акт переноса не составлен: ' + $_.Exception.Message) 'warn' }
+        try { $act = New-Act $m $rec; Write-Log ((T '   акт переноса: {0}') -f $act) }
+        catch { Write-Log ((T '   акт переноса не составлен: ') + $_.Exception.Message) 'warn' }
     }
 
     $st = Get-Worst $results
-    Write-Log ('=== Развёрнуто: {0} на {1} за {2}{3}' -f $user.Login, $pc.Name, (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { '. Есть замечания, см. выше' } else { '' })) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
+    Write-Log ((T '=== Развёрнуто: {0} на {1} за {2}{3}') -f $user.Login, $pc.Name, (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { (T '. Есть замечания, см. выше') } else { '' })) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
     $n = "`r`n"
     $txt = ''
     $done = @{}
     foreach ($i in $results) { if ($i.Status -in @('ok', 'warn')) { $done[[string]$i.Key] = $true } }
     $checks = New-Object System.Collections.Generic.List[string]
-    $fl = @($script:Cfg.Folders | Where-Object { $done.ContainsKey($_.Key) } | ForEach-Object { $_.Title })
-    if ($fl.Count) { $checks.Add(($fl -join ', ') + ': файлы на месте.') }
+    $fl = @($script:Cfg.Folders | Where-Object { $done.ContainsKey($_.Key) } | ForEach-Object { $script:Titles[[string]$_.Key] })
+    if ($fl.Count) { $checks.Add(($fl -join ', ') + (T ': файлы на месте.')) }
     $doneB = @($script:Browsers | Where-Object { $done.ContainsKey($_.Key) })
     foreach ($b in $doneB) {
-        $t = '{0}: закладки и вкладки на месте, сохранённые пароли открываются (при просмотре Windows может спросить пароль сотрудника).' -f $b.Title
+        $t = (T '{0}: закладки и вкладки на месте, сохранённые пароли открываются (при просмотре Windows может спросить пароль сотрудника).') -f $b.Title
         if ($b.Note) { $t += ' ' + $b.Note }
         $checks.Add($t)
     }
-    if ($done.ContainsKey('CryptoReg') -or $done.ContainsKey('CryptoDir') -or $done.ContainsKey('CertsMy')) { $checks.Add('КриптоПро: Инструменты КриптоПро → Контейнеры: подписи видны, сертификат открывается. Лицензия КриптоПро на новом ПК своя.') }
+    if ($done.ContainsKey('CryptoReg') -or $done.ContainsKey('CryptoDir') -or $done.ContainsKey('CertsMy')) { $checks.Add((T 'КриптоПро: Инструменты КриптоПро → Контейнеры: подписи видны, сертификат открывается. Лицензия КриптоПро на новом ПК своя.')) }
     if ($checks.Count) {
-        $txt += 'Проверить с сотрудником:' + $n
+        $txt += (T 'Проверить с сотрудником:') + $n
         for ($j = 0; $j -lt $checks.Count; $j++) { $txt += ('{0}. {1}' -f ($j + 1), $checks[$j]) + $n }
     }
-    if ($doneB.Count) { $txt += $n + ('Если пароли не открылись: экспорт паролей в CSV на старом ПК и импорт на новом. Если браузер был открыт во время переноса, закрыть и открыть. Копия хранится {0} дней.' -f $script:Cfg.RetentionDays) }
+    if ($doneB.Count) { $txt += $n + ((T 'Если пароли не открылись: экспорт паролей в CSV на старом ПК и импорт на новом. Если браузер был открыт во время переноса, закрыть и открыть. Копия хранится {0} дней.') -f $script:Cfg.RetentionDays) }
     return [pscustomobject]@{
         Status   = $st
         User     = $user
         Pc       = $pc
-        Head     = ('Готово: {0} ({1}) на {2}.' -f $user.Name, $user.Login, $pc.Name)
+        Head     = ((T 'Готово: {0} ({1}) на {2}.') -f $user.Name, $user.Login, $pc.Name)
         LongText = (Get-LongPathText)
         Checks   = $txt
         Act      = $act
@@ -1537,32 +1572,32 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $
 # на новом ПК развернуть некуда, и снимать копию тогда незачем
 function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$Groups, [string]$Password = '') {
     $t0 = Get-Date
-    Write-Log ('=== Перенести сразу: {0} с {1} на {2}' -f $Login, $OldPc, $NewPc) 'head'
+    Write-Log ((T '=== Перенести сразу: {0} с {1} на {2}') -f $Login, $OldPc, $NewPc) 'head'
     $user = Get-PmUser $Login
     $pcOld = Resolve-Pc $OldPc
     Test-PcAccess $pcOld
     $pcNew = Resolve-Pc $NewPc
     Test-PcAccess $pcNew
     if ($pcOld.Host -eq $pcNew.Host -or $pcOld.Name -ieq $pcNew.Name) {
-        throw ('Старый и новый ПК: один и тот же компьютер ({0}). Чтобы вернуть данные на тот же ПК (например, после переустановки Windows), снимите копию кнопкой «Снять с ПК», а потом «Развернуть на ПК»' -f $pcNew.Name)
+        throw ((T 'Старый и новый ПК: один и тот же компьютер ({0}). Чтобы вернуть данные на тот же ПК (например, после переустановки Windows), снимите копию кнопкой «Снять с ПК», а потом «Развернуть на ПК»') -f $pcNew.Name)
     }
     try { $profNew = Find-UserProfile $pcNew $user } finally { Restore-RemoteRegistry }
-    if (-not $profNew.Unc) { throw ('Сотрудник ещё не входил на {0}: профиля нет. Пусть войдёт в Windows один раз, потом снова «Перенести сразу». Копия ещё не снималась' -f $pcNew.Name) }
-    Write-Log ('   новый ПК {0} ({1}): доступ есть, профиль {2}' -f $pcNew.Name, $pcNew.Host, $profNew.Local)
+    if (-not $profNew.Unc) { throw ((T 'Сотрудник ещё не входил на {0}: профиля нет. Пусть войдёт в Windows один раз, потом снова «Перенести сразу». Копия ещё не снималась') -f $pcNew.Name) }
+    Write-Log ((T '   новый ПК {0} ({1}): доступ есть, профиль {2}') -f $pcNew.Name, $pcNew.Host, $profNew.Local)
 
     # Зашифрованную копию разворачиваем из временной папки, где её собрали: расшифровывать архив незачем
     $cap = Invoke-Capture $Login $OldPc $Groups $pcOld -Password $Password -KeepData
     try { $res = Invoke-Restore ([pscustomobject]@{ Path = $cap.Path }) $NewPc $Groups $pcNew -DataDir $cap.DataDir }
     catch {
-        throw ('Копия снята, но развернуть на {0} не удалось: {1}{2}{2}Копия лежит в хранилище: когда причина будет устранена, выберите её в списке и нажмите «Развернуть на ПК».' -f $pcNew.Name, $_.Exception.Message, "`r`n")
+        throw ((T 'Копия снята, но развернуть на {0} не удалось: {1}{2}{2}Копия лежит в хранилище: когда причина будет устранена, выберите её в списке и нажмите «Развернуть на ПК».') -f $pcNew.Name, $_.Exception.Message, "`r`n")
     }
     finally { if ($cap.DataDir -ne $cap.Path) { Remove-Staging $cap.DataDir } }
     $st = Get-Worst @($cap, $res)
     $span = Format-Span ((Get-Date) - $t0)
-    Write-Log ('=== Перенесено: {0} с {1} на {2}, {3}, за {4}' -f $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
+    Write-Log ((T '=== Перенесено: {0} с {1} на {2}, {3}, за {4}') -f $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
     return [pscustomobject]@{
         Status   = $st
-        Head     = ('Перенесено: {0} ({1}) с {2} на {3}, {4} за {5}.' -f $user.Name, $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) + $(if ($cap.Encrypted) { ' ' + 'Копия в хранилище зашифрована паролем.' } else { '' })
+        Head     = ((T 'Перенесено: {0} ({1}) с {2} на {3}, {4} за {5}.') -f $user.Name, $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) + $(if ($cap.Encrypted) { ' ' + (T 'Копия в хранилище зашифрована паролем.') } else { '' })
         LongText = ($cap.LongText + $res.LongText)
         Checks   = $res.Checks
         Act      = $res.Act
@@ -1574,13 +1609,13 @@ function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$
 function Show-Result($R, [string]$Tail = '') {
     $n = "`r`n"
     $txt = $R.Head + $n + $n
-    if ($R.Status -ne 'ok') { $txt += 'Есть замечания: см. журнал в окне.' + $n + $n }
+    if ($R.Status -ne 'ok') { $txt += (T 'Есть замечания: см. журнал в окне.') + $n + $n }
     $txt += $R.LongText
     if ($R.PSObject.Properties['Checks'] -and $R.Checks) { $txt += $R.Checks }
     if ($Tail) { $txt += $Tail }
     $icon = if ($R.Status -eq 'ok') { 'Information' } else { 'Warning' }
     if ($R.PSObject.Properties['Act'] -and $R.Act) {
-        $txt = $txt.TrimEnd() + $n + $n + 'Открыть акт переноса для печати и подписи?'
+        $txt = $txt.TrimEnd() + $n + $n + (T 'Открыть акт переноса для печати и подписи?')
         if ((Show-Msg $txt $icon 'YesNo') -eq 'Yes') { Open-Act $R.Act }
         return
     }
@@ -1593,10 +1628,10 @@ function ConvertTo-HtmlText($S) { return [System.Net.WebUtility]::HtmlEncode([st
 
 function Get-ActStatus([string]$S) {
     switch ($S) {
-        'ok'   { return 'перенесено' }
-        'warn' { return 'с замечаниями' }
-        'err'  { return 'ошибка' }
-        'skip' { return 'пропущено' }
+        'ok'   { return (T 'перенесено') }
+        'warn' { return (T 'с замечаниями') }
+        'err'  { return (T 'ошибка') }
+        'skip' { return (T 'пропущено') }
         default { return $S }
     }
 }
@@ -1616,9 +1651,9 @@ function New-Act($M, $Rec) {
     $items = @(@($src) | Where-Object { $_ -and [string]$_.Status -notin @('none', '') -and [string]$_.Key -ne 'Archive' })
     $worst = Get-Worst $items
     if ($worst -eq 'ok' -and @($items | Where-Object { [string]$_.Status -eq 'skip' }).Count) { $worst = 'warn' }   # пропущенное = замечание
-    $kind = if (-not $restored) { 'резервного копирования данных пользователя' }
-            elseif ($pcTo -ieq [string]$M.SourcePC) { 'восстановления данных пользователя на компьютере' }
-            else { 'переноса данных пользователя на другой компьютер' }
+    $kind = if (-not $restored) { (T 'резервного копирования данных пользователя') }
+            elseif ($pcTo -ieq [string]$M.SourcePC) { (T 'восстановления данных пользователя на компьютере') }
+            else { (T 'переноса данных пользователя на другой компьютер') }
 
     $rows = New-Object Text.StringBuilder
     $i = 0
@@ -1631,20 +1666,20 @@ function New-Act($M, $Rec) {
         [void]$rows.Append(('<tr><td class="c">{0}</td><td>{1}</td><td class="r">{2}</td><td class="r">{3}</td><td>{4}</td><td>{5}</td></tr>{6}' -f
             $i, (& $h $title), (& $h $files), (& $h $size), (& $h (Get-ActStatus ([string]$it.Status))), (& $h $it.Note), $n))
     }
-    if (-not $i) { [void]$rows.Append(('<tr><td colspan="6">{0}</td></tr>' -f (& $h 'ничего не перенесено'))) }
+    if (-not $i) { [void]$rows.Append(('<tr><td colspan="6">{0}</td></tr>' -f (& $h (T 'ничего не перенесено')))) }
 
     $info = New-Object Text.StringBuilder
     $addInfo = { param($k, $v) [void]$info.Append(('<tr><td class="k">{0}</td><td>{1}</td></tr>{2}' -f (& $h $k), $v, $n)) }
-    & $addInfo 'Сотрудник:' ('<b>{0}</b> ({1})' -f (& $h $M.Name), (& $h $M.Login))
-    & $addInfo $(if ($restored -and $pcTo -ine [string]$M.SourcePC) { 'Старый компьютер:' } else { 'Компьютер:' }) ('{0}, копия данных снята {1}' -f (& $h $M.SourcePC), (& $h ([datetime]$M.Created).ToString('dd.MM.yyyy HH:mm')))
-    if ($restored -and $pcTo -ine [string]$M.SourcePC) { & $addInfo 'Новый компьютер:' ('{0}, данные перенесены {1}' -f (& $h $pcTo), (& $h $when.ToString('dd.MM.yyyy HH:mm'))) }
-    elseif ($restored) { & $addInfo 'Восстановлено:' (& $h $when.ToString('dd.MM.yyyy HH:mm')) }
-    & $addInfo 'Учётная запись исполнителя:' (& $h $(if ($restored) { $Rec.Operator } else { $M.Operator }))
+    & $addInfo (T 'Сотрудник:') ('<b>{0}</b> ({1})' -f (& $h $M.Name), (& $h $M.Login))
+    & $addInfo $(if ($restored -and $pcTo -ine [string]$M.SourcePC) { (T 'Старый компьютер:') } else { (T 'Компьютер:') }) ((T '{0}, копия данных снята {1}') -f (& $h $M.SourcePC), (& $h ([datetime]$M.Created).ToString($script:DateFmt)))
+    if ($restored -and $pcTo -ine [string]$M.SourcePC) { & $addInfo (T 'Новый компьютер:') ((T '{0}, данные перенесены {1}') -f (& $h $pcTo), (& $h $when.ToString($script:DateFmt))) }
+    elseif ($restored) { & $addInfo (T 'Восстановлено:') (& $h $when.ToString($script:DateFmt)) }
+    & $addInfo (T 'Учётная запись исполнителя:') (& $h $(if ($restored) { $Rec.Operator } else { $M.Operator }))
 
-    $sum = if (-not $i) { 'Данные не перенесены.' }
-           elseif ($worst -eq 'ok') { 'Данные перенесены полностью, замечаний нет.' }
-           else { 'Данные перенесены с замечаниями, см. графу «Примечание».' }
-    if (-not $restored) { $sum = if ($worst -eq 'ok') { 'Копия данных снята полностью, замечаний нет.' } else { 'Копия данных снята с замечаниями, см. графу «Примечание».' } }
+    $sum = if (-not $i) { (T 'Данные не перенесены.') }
+           elseif ($worst -eq 'ok') { (T 'Данные перенесены полностью, замечаний нет.') }
+           else { (T 'Данные перенесены с замечаниями, см. графу «Примечание».') }
+    if (-not $restored) { $sum = if ($worst -eq 'ok') { (T 'Копия данных снята полностью, замечаний нет.') } else { (T 'Копия данных снята с замечаниями, см. графу «Примечание».') } }
 
     $html = @"
 <!DOCTYPE html>
@@ -1656,7 +1691,7 @@ function New-Act($M, $Rec) {
 @page {{ size: A4; margin: 15mm 15mm 15mm 20mm; }}
 body {{ font-family: "Times New Roman", Times, serif; font-size: 12pt; color: #000; max-width: 175mm; margin: 16px auto; }}
 .org {{ text-align: center; margin-bottom: 18px; }}
-h1 {{ font-size: 14pt; text-align: center; margin: 0; letter-spacing: 2px; }}
+h1 {{ font-size: 14pt; text-align: center; margin: 0; letter-spacing: 2px; text-transform: uppercase; }}
 .sub {{ text-align: center; font-weight: bold; margin: 2px 0 14px; }}
 .date {{ text-align: right; margin-bottom: 12px; }}
 table {{ border-collapse: collapse; }}
@@ -1686,7 +1721,7 @@ table {{ border-collapse: collapse; }}
 {6}</table>
 <p>{7}</p>
 <table class="items">
-<tr><th>№</th><th>{8}</th><th>{9}</th><th>{10}</th><th>{11}</th><th>{12}</th></tr>
+<tr><th>{23}</th><th>{8}</th><th>{9}</th><th>{10}</th><th>{11}</th><th>{12}</th></tr>
 {13}</table>
 <p>{14}</p>
 <p>{15}</p>
@@ -1699,24 +1734,25 @@ table {{ border-collapse: collapse; }}
 <div class="foot">{22}</div>
 </body>
 </html>
-"@ -f (& $h ('{0}: {1}, {2}' -f 'Акт', $M.Name, $when.ToString('dd.MM.yyyy'))),
-        (& $h 'Печать'),
+"@ -f (& $h ('{0}: {1}, {2}' -f (T 'Акт'), $M.Name, $when.ToString($script:DayFmt))),
+        (& $h (T 'Печать')),
         (& $h $script:Cfg.OrgName),
-        (& $h 'АКТ'),
+        (& $h (T 'Акт')),
         (& $h $kind),
-        (& $h $when.ToString('dd.MM.yyyy')),
+        (& $h $when.ToString($script:DayFmt)),
         $info.ToString(),
-        (& $h $(if ($restored) { 'Перенесены данные:' } else { 'В копию сняты данные:' })),
-        (& $h 'Данные'), (& $h 'Файлов'), (& $h 'Объём'), (& $h 'Итог'), (& $h 'Примечание'),
+        (& $h $(if ($restored) { (T 'Перенесены данные:') } else { (T 'В копию сняты данные:') })),
+        (& $h (T 'Данные')), (& $h (T 'Файлов')), (& $h (T 'Объём')), (& $h (T 'Итог')), (& $h (T 'Примечание')),
         $rows.ToString(),
         (& $h $sum),
-        (& $h ('На компьютере, с которого сняты данные, ничего не удалялось и не изменялось. ' + $(if ($M.Encrypted) { 'Копия данных зашифрована паролем (7-Zip, AES-256) и хранится {0} дней, затем удаляется.' } else { 'Копия данных хранится {0} дней, затем удаляется.' }) -f $script:Cfg.RetentionDays)),
-        (& $h 'Перенос выполнил'),
-        (& $h 'подпись'), (& $h 'фамилия, инициалы'),
-        (& $h 'Данные проверил, претензий нет'),
+        (& $h ((T 'На компьютере, с которого сняты данные, ничего не удалялось и не изменялось. ') + $(if ($M.Encrypted) { (T 'Копия данных зашифрована паролем (7-Zip, AES-256) и хранится {0} дней, затем удаляется.') } else { (T 'Копия данных хранится {0} дней, затем удаляется.') }) -f $script:Cfg.RetentionDays)),
+        (& $h (T 'Перенос выполнил')),
+        (& $h (T 'подпись')), (& $h (T 'фамилия, инициалы')),
+        (& $h (T 'Данные проверил, претензий нет')),
         (& $h $M.Name),
-        (& $h 'подпись сотрудника'),
-        (& $h ('Составлено окном «Перенос профиля», {0}, {1}' -f $script:Version, (Get-Date).ToString('dd.MM.yyyy HH:mm')))
+        (& $h (T 'подпись сотрудника')),
+        (& $h ((T 'Составлено окном «Перенос профиля», {0}, {1}') -f $script:Version, (Get-Date).ToString($script:DateFmt))),
+        (& $h (T '№'))
 
     $dir = Join-Path $script:LogDir 'acts'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -1727,18 +1763,18 @@ table {{ border-collapse: collapse; }}
 
 function Open-Act([string]$Path) {
     try { Start-Process -FilePath $Path }
-    catch { [void](Show-Msg ('Акт не открылся: {0}{1}{1}Файл: {2}' -f $_.Exception.Message, "`r`n", $Path) 'Warning') }
+    catch { [void](Show-Msg ((T 'Акт не открылся: {0}{1}{1}Файл: {2}') -f $_.Exception.Message, "`r`n", $Path) 'Warning') }
 }
 
 # Акт по выбранной копии: по последнему развёртыванию, если его не было, то о резервной копии
 function Show-ActForCopy {
     $c = Get-SelectedCopy
-    if (-not $c) { throw 'Выберите копию в списке' }
+    if (-not $c) { throw (T 'Выберите копию в списке') }
     $m = Read-Manifest $c.Path
-    if (-not $m) { throw 'В копии нет manifest.json: акт составить не из чего' }
+    if (-not $m) { throw (T 'В копии нет manifest.json: акт составить не из чего') }
     $rec = @($m.Restores) | Where-Object { $_ } | Select-Object -Last 1
     $p = New-Act $m $rec
-    Write-Log ('=== Акт по копии {0}: {1}' -f $c.Path, $p) 'head'
+    Write-Log ((T '=== Акт по копии {0}: {1}') -f $c.Path, $p) 'head'
     Open-Act $p
 }
 
@@ -1778,7 +1814,7 @@ function Add-DialogButtons($F, [string]$OkText, [int]$Y) {
     $ok.Text = $OkText; $ok.Width = 120; $ok.Height = 30; $ok.Left = $F.ClientSize.Width - 260; $ok.Top = $Y
     $ok.DialogResult = 'OK'
     $cancel = New-Object Windows.Forms.Button
-    $cancel.Text = 'Отмена'; $cancel.Width = 120; $cancel.Height = 30; $cancel.Left = $F.ClientSize.Width - 132; $cancel.Top = $Y
+    $cancel.Text = (T 'Отмена'); $cancel.Width = 120; $cancel.Height = 30; $cancel.Left = $F.ClientSize.Width - 132; $cancel.Top = $Y
     $cancel.DialogResult = 'Cancel'
     $F.Controls.Add($ok); $F.Controls.Add($cancel)
     $F.AcceptButton = $ok; $F.CancelButton = $cancel
@@ -1789,9 +1825,9 @@ function Add-DialogButtons($F, [string]$OkText, [int]$Y) {
 # Checks: Key → CheckBox по порядку; Bottom: Y под последней галочкой
 function Add-GroupChecks($F, [int]$Y) {
     $checks = [ordered]@{}
-    foreach ($fd in $script:Cfg.Folders) { $checks[[string]$fd.Key] = New-Check $F ([string]$fd.Title) 24 $Y; $Y += 22 }
-    foreach ($b in $script:Browsers) { $checks[$b.Key] = New-Check $F ('{0}: закладки, пароли, вкладки' -f $b.Title) 24 $Y; $Y += 22 }
-    if ($script:Cfg.EnableCryptoPro) { $checks['Crypto'] = New-Check $F 'Подписи КриптоПро и личные сертификаты' 24 $Y; $Y += 22 }
+    foreach ($fd in $script:Cfg.Folders) { $checks[[string]$fd.Key] = New-Check $F ($script:Titles[[string]$fd.Key]) 24 $Y; $Y += 22 }
+    foreach ($b in $script:Browsers) { $checks[$b.Key] = New-Check $F ((T '{0}: закладки, пароли, вкладки') -f $b.Title) 24 $Y; $Y += 22 }
+    if ($script:Cfg.EnableCryptoPro) { $checks['Crypto'] = New-Check $F (T 'Подписи КриптоПро и личные сертификаты') 24 $Y; $Y += 22 }
     return [pscustomobject]@{ Checks = $checks; Bottom = $Y }
 }
 
@@ -1802,7 +1838,7 @@ function Get-GroupChecks($Checks) {
 # Encrypt = Required, а 7-Zip нет: снимать нельзя
 function Assert-Encrypt {
     if ($script:Cfg.Encrypt -eq 'Required' -and -not $script:SevenZip) {
-        throw 'В config.psd1 Encrypt = Required (копии только с шифрованием), а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip'
+        throw (T 'В config.psd1 Encrypt = Required (копии только с шифрованием), а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip')
     }
 }
 
@@ -1812,12 +1848,12 @@ function Add-EncryptBox($F, [int]$Y) {
     $r = [pscustomobject]@{ Check = $null; P1 = $null; P2 = $null; Bottom = $Y }
     if ($script:Cfg.Encrypt -eq 'Off' -or -not $script:SevenZip) { return $r }
     $Y += 6
-    $r.Check = New-Check $F 'Зашифровать копию паролем (7-Zip, AES-256)' 24 $Y ($script:Cfg.Encrypt -eq 'On' -or $script:Cfg.Encrypt -eq 'Required')
+    $r.Check = New-Check $F (T 'Зашифровать копию паролем (7-Zip, AES-256)') 24 $Y ($script:Cfg.Encrypt -eq 'On' -or $script:Cfg.Encrypt -eq 'Required')
     if ($script:Cfg.Encrypt -eq 'Required') { $r.Check.Enabled = $false }
     $Y += 26
-    [void](New-Label $F 'Пароль:' 42 ($Y + 3) 62)
+    [void](New-Label $F (T 'Пароль:') 42 ($Y + 3) 62)
     $r.P1 = New-Text $F 106 $Y 140
-    [void](New-Label $F 'Ещё раз:' 256 ($Y + 3) 62)
+    [void](New-Label $F (T 'Ещё раз:') 256 ($Y + 3) 62)
     $r.P2 = New-Text $F 320 $Y 126
     foreach ($t in @($r.P1, $r.P2)) { $t.UseSystemPasswordChar = $true; $t.Enabled = $r.Check.Checked }
     $r.Check.Tag = @($r.P1, $r.P2)
@@ -1831,30 +1867,30 @@ function Get-EncryptPassword($Eb) {
     if (-not $Eb.Check -or -not $Eb.Check.Checked) { return @{ Error = ''; Password = '' } }
     $p = $Eb.P1.Text
     $err = Test-CopyPassword $p
-    if (-not $err -and $p -cne $Eb.P2.Text) { $err = 'Пароли не совпадают.' }
+    if (-not $err -and $p -cne $Eb.P2.Text) { $err = (T 'Пароли не совпадают.') }
     if (-not $err) { $err = $null }
     return @{ Error = [string]$err; Password = $p }
 }
 
 function Show-CaptureDialog {
     Assert-Encrypt
-    $f = New-Dialog 'Снять с ПК: данные сотрудника в хранилище' 460 330
-    [void](New-Label $f 'Логин сотрудника в AD (например, ivanov_ii):' 12 12)
+    $f = New-Dialog (T 'Снять с ПК: данные сотрудника в хранилище') 460 330
+    [void](New-Label $f (T 'Логин сотрудника в AD (например, ivanov_ii):') 12 12)
     $tLogin = New-Text $f 12 32
-    [void](New-Label $f 'Старый ПК: имя (например, PC-042) или IP:' 12 66)
+    [void](New-Label $f (T 'Старый ПК: имя (например, PC-042) или IP:') 12 66)
     $tPc = New-Text $f 12 86
-    [void](New-Label $f 'Что снять:' 12 122)
+    [void](New-Label $f (T 'Что снять:') 12 122)
     $gc = Add-GroupChecks $f 142
     $checks = $gc.Checks
     $eb = Add-EncryptBox $f $gc.Bottom
     $f.ClientSize = New-Object Drawing.Size(460, ($eb.Bottom + 78))
-    $ok = Add-DialogButtons $f 'Снять' ($eb.Bottom + 32)
+    $ok = Add-DialogButtons $f (T 'Снять') ($eb.Bottom + 32)
     $st = @{}
     $ok.Add_Click({
         $err = ''
-        if ($tLogin.Text.Trim() -notmatch '^[A-Za-z0-9._-]{1,64}$') { $err = 'Введите логин сотрудника (латиницей, как в AD).' }
-        elseif (-not $tPc.Text.Trim()) { $err = 'Введите имя старого ПК.' }
-        elseif (-not (Get-GroupChecks $checks).Count) { $err = 'Отметьте, что снять.' }
+        if ($tLogin.Text.Trim() -notmatch '^[A-Za-z0-9._-]{1,64}$') { $err = (T 'Введите логин сотрудника (латиницей, как в AD).') }
+        elseif (-not $tPc.Text.Trim()) { $err = (T 'Введите имя старого ПК.') }
+        elseif (-not (Get-GroupChecks $checks).Count) { $err = (T 'Отметьте, что снять.') }
         $pw = Get-EncryptPassword $eb
         if (-not $err) { $err = $pw.Error }
         if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
@@ -1863,32 +1899,32 @@ function Show-CaptureDialog {
     if ($f.ShowDialog($script:MainForm) -ne 'OK') { $f.Dispose(); return }
     $f.Dispose()
     $r = Invoke-Capture $st.Login $st.Pc $st.Groups -Password $st.Password
-    Show-Result $r 'Дальше: сотрудник один раз входит в Windows на новом ПК, потом в этом окне «Развернуть на ПК».'
+    Show-Result $r (T 'Дальше: сотрудник один раз входит в Windows на новом ПК, потом в этом окне «Развернуть на ПК».')
 }
 
 function Show-RestoreDialog {
     $sel = Get-SelectedCopy
-    $f = New-Dialog 'Развернуть на ПК: данные сотрудника из копии' 520 380
-    [void](New-Label $f 'Логин сотрудника:' 12 12)
+    $f = New-Dialog (T 'Развернуть на ПК: данные сотрудника из копии') 520 380
+    [void](New-Label $f (T 'Логин сотрудника:') 12 12)
     $tLogin = New-Text $f 12 32 220 $(if ($sel) { $sel.Login } else { '' })
     $bFind = New-Object Windows.Forms.Button
-    $bFind.Text = 'Найти копии'; $bFind.Left = 240; $bFind.Top = 30; $bFind.Width = 110; $bFind.Height = 26
+    $bFind.Text = (T 'Найти копии'); $bFind.Left = 240; $bFind.Top = 30; $bFind.Width = 110; $bFind.Height = 26
     $f.Controls.Add($bFind)
-    [void](New-Label $f 'Копия (самая свежая сверху):' 12 66)
+    [void](New-Label $f (T 'Копия (самая свежая сверху):') 12 66)
     $cb = New-Object Windows.Forms.ComboBox
     $cb.Left = 12; $cb.Top = 86; $cb.Width = 490; $cb.DropDownStyle = 'DropDownList'
     $f.Controls.Add($cb)
-    [void](New-Label $f 'Новый ПК: имя или IP (сотрудник уже входил на него):' 12 120 490)
+    [void](New-Label $f (T 'Новый ПК: имя или IP (сотрудник уже входил на него):') 12 120 490)
     $tPc = New-Text $f 12 140
-    [void](New-Label $f 'Что развернуть (серое: этого нет в копии):' 12 176)
+    [void](New-Label $f (T 'Что развернуть (серое: этого нет в копии):') 12 176)
     $gc = Add-GroupChecks $f 196
     $checks = $gc.Checks
-    [void](New-Label $f 'Пароль копии (если она зашифрована):' 24 ($gc.Bottom + 11) 230)
+    [void](New-Label $f (T 'Пароль копии (если она зашифрована):') 24 ($gc.Bottom + 11) 230)
     $tPass = New-Text $f 258 ($gc.Bottom + 8) 180
     $tPass.UseSystemPasswordChar = $true
     $tPass.Enabled = $false
     $f.ClientSize = New-Object Drawing.Size(520, ($gc.Bottom + 108))
-    $ok = Add-DialogButtons $f 'Развернуть' ($gc.Bottom + 62)
+    $ok = Add-DialogButtons $f (T 'Развернуть') ($gc.Bottom + 62)
     $st = @{ List = @() }
 
     $fill = {
@@ -1896,14 +1932,14 @@ function Show-RestoreDialog {
         $tPass.Enabled = $false; $tPass.Text = ''
         $login = $tLogin.Text.Trim()
         $st.List = @($script:Copies | Where-Object { $_.Login -eq $login })
-        foreach ($c in $st.List) { [void]$cb.Items.Add(('{0}  с {1},  {2},  {3}{4}' -f $c.When.ToString('dd.MM.yyyy HH:mm'), $c.Pc, (Format-Size $c.Bytes), $c.Status, $(if ($c.Restored) { ',  уже разворачивали: ' + $c.Restored } else { '' }))) }
+        foreach ($c in $st.List) { [void]$cb.Items.Add(((T '{0}  с {1},  {2},  {3}{4}') -f $c.When.ToString($script:DateFmt), $c.Pc, (Format-Size $c.Bytes), $c.Status, $(if ($c.Restored) { (T ',  уже разворачивали: ') + $c.Restored } else { '' }))) }
         if ($cb.Items.Count) {
             $idx = 0
             if ($sel) { for ($i = 0; $i -lt $st.List.Count; $i++) { if ($st.List[$i].Path -eq $sel.Path) { $idx = $i } } }
             $cb.SelectedIndex = $idx
         }
     }
-    $bFind.Add_Click({ & $fill; if (-not $cb.Items.Count) { [void](Show-Msg ('Копий для «{0}» в хранилище нет.' -f $tLogin.Text.Trim()) 'Warning') } })
+    $bFind.Add_Click({ & $fill; if (-not $cb.Items.Count) { [void](Show-Msg ((T 'Копий для «{0}» в хранилище нет.') -f $tLogin.Text.Trim()) 'Warning') } })
     $cb.Add_SelectedIndexChanged({
         $c = $st.List[$cb.SelectedIndex]
         $tPass.Enabled = $c.Encrypted
@@ -1921,18 +1957,18 @@ function Show-RestoreDialog {
     })
     $ok.Add_Click({
         $err = ''
-        if ($cb.SelectedIndex -lt 0) { $err = 'Выберите копию: введите логин и нажмите «Найти копии».' }
-        elseif (-not $tPc.Text.Trim()) { $err = 'Введите имя нового ПК.' }
-        elseif (-not (Get-GroupChecks $checks).Count) { $err = 'Отметьте, что развернуть.' }
+        if ($cb.SelectedIndex -lt 0) { $err = (T 'Выберите копию: введите логин и нажмите «Найти копии».') }
+        elseif (-not $tPc.Text.Trim()) { $err = (T 'Введите имя нового ПК.') }
+        elseif (-not (Get-GroupChecks $checks).Count) { $err = (T 'Отметьте, что развернуть.') }
         if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
         $c = $st.List[$cb.SelectedIndex]
         if ($tPc.Text.Trim() -ieq $c.Pc) {
-            if ((Show-Msg ('Копия снята с этого же ПК ({0}). Разворачивать на него же?' -f $c.Pc) 'Question' 'YesNo') -ne 'Yes') { $f.DialogResult = 'None'; return }
+            if ((Show-Msg ((T 'Копия снята с этого же ПК ({0}). Разворачивать на него же?') -f $c.Pc) 'Question' 'YesNo') -ne 'Yes') { $f.DialogResult = 'None'; return }
         }
         # Пароль зашифрованной копии проверяем сразу (7-Zip читает только список файлов): ошибся, окно не закрывается
         if ($c.Encrypted) {
-            if (-not $script:SevenZip) { $err = 'Копия зашифрована, а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip в config.psd1.' }
-            elseif (-not $tPass.Text) { $err = 'Копия зашифрована: введите её пароль.' }
+            if (-not $script:SevenZip) { $err = (T 'Копия зашифрована, а 7-Zip на этом ПК не найден: установите 7-Zip или укажите путь к 7z.exe в SevenZip в config.psd1.') }
+            elseif (-not $tPass.Text) { $err = (T 'Копия зашифрована: введите её пароль.') }
             else {
                 try { $err = Test-ArchivePassword (Join-Path $c.Path ([string]$c.Manifest.Archive)) $tPass.Text }
                 catch { $err = $_.Exception.Message }
@@ -1950,27 +1986,27 @@ function Show-RestoreDialog {
 
 function Show-MoveDialog {
     Assert-Encrypt
-    $f = New-Dialog 'Перенести сразу: со старого ПК на новый' 460 360
-    [void](New-Label $f 'Логин сотрудника в AD (например, ivanov_ii):' 12 12)
+    $f = New-Dialog (T 'Перенести сразу: со старого ПК на новый') 460 360
+    [void](New-Label $f (T 'Логин сотрудника в AD (например, ivanov_ii):') 12 12)
     $tLogin = New-Text $f 12 32
-    [void](New-Label $f 'Старый ПК: имя (например, PC-042) или IP:' 12 66)
+    [void](New-Label $f (T 'Старый ПК: имя (например, PC-042) или IP:') 12 66)
     $tOld = New-Text $f 12 86
-    [void](New-Label $f 'Новый ПК: имя или IP (сотрудник уже входил на него):' 12 120)
+    [void](New-Label $f (T 'Новый ПК: имя или IP (сотрудник уже входил на него):') 12 120)
     $tNew = New-Text $f 12 140
-    [void](New-Label $f 'Что перенести:' 12 176)
+    [void](New-Label $f (T 'Что перенести:') 12 176)
     $gc = Add-GroupChecks $f 196
     $checks = $gc.Checks
     $eb = Add-EncryptBox $f $gc.Bottom
     $f.ClientSize = New-Object Drawing.Size(460, ($eb.Bottom + 78))
-    $ok = Add-DialogButtons $f 'Перенести' ($eb.Bottom + 32)
+    $ok = Add-DialogButtons $f (T 'Перенести') ($eb.Bottom + 32)
     $st = @{}
     $ok.Add_Click({
         $err = ''
-        if ($tLogin.Text.Trim() -notmatch '^[A-Za-z0-9._-]{1,64}$') { $err = 'Введите логин сотрудника (латиницей, как в AD).' }
-        elseif (-not $tOld.Text.Trim()) { $err = 'Введите имя старого ПК.' }
-        elseif (-not $tNew.Text.Trim()) { $err = 'Введите имя нового ПК.' }
-        elseif ($tOld.Text.Trim() -ieq $tNew.Text.Trim()) { $err = 'Старый и новый ПК совпадают. Чтобы вернуть данные на тот же ПК, используйте «Снять с ПК» и «Развернуть на ПК».' }
-        elseif (-not (Get-GroupChecks $checks).Count) { $err = 'Отметьте, что перенести.' }
+        if ($tLogin.Text.Trim() -notmatch '^[A-Za-z0-9._-]{1,64}$') { $err = (T 'Введите логин сотрудника (латиницей, как в AD).') }
+        elseif (-not $tOld.Text.Trim()) { $err = (T 'Введите имя старого ПК.') }
+        elseif (-not $tNew.Text.Trim()) { $err = (T 'Введите имя нового ПК.') }
+        elseif ($tOld.Text.Trim() -ieq $tNew.Text.Trim()) { $err = (T 'Старый и новый ПК совпадают. Чтобы вернуть данные на тот же ПК, используйте «Снять с ПК» и «Развернуть на ПК».') }
+        elseif (-not (Get-GroupChecks $checks).Count) { $err = (T 'Отметьте, что перенести.') }
         $pw = Get-EncryptPassword $eb
         if (-not $err) { $err = $pw.Error }
         if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
@@ -1984,15 +2020,15 @@ function Show-MoveDialog {
 
 function Show-CopyDetails {
     $c = Get-SelectedCopy
-    if (-not $c) { throw 'Выберите копию в списке' }
+    if (-not $c) { throw (T 'Выберите копию в списке') }
     $m = $c.Manifest
-    Write-Log ('=== Копия {0}' -f $c.Path) 'head'
-    if (-not $m) { Write-Log '   manifest.json нет или не читается' 'warn'; return }
-    Write-Log ('   {0} ({1}), снята с {2} {3}, оператор {4}, итог: {5}, {6}' -f $m.Name, $m.Login, $m.SourcePC, ([datetime]$m.Created).ToString('dd.MM.yyyy HH:mm'), $m.Operator, $c.Status, (Format-Size $m.Bytes))
-    if ($m.Encrypted) { Write-Log ('   зашифрована паролем (7-Zip, AES-256): {0}, {1}' -f $m.Archive, (Format-Size ([long]$m.ArchiveBytes))) }
+    Write-Log ((T '=== Копия {0}') -f $c.Path) 'head'
+    if (-not $m) { Write-Log (T '   manifest.json нет или не читается') 'warn'; return }
+    Write-Log ((T '   {0} ({1}), снята с {2} {3}, оператор {4}, итог: {5}, {6}') -f $m.Name, $m.Login, $m.SourcePC, ([datetime]$m.Created).ToString($script:DateFmt), $m.Operator, $c.Status, (Format-Size $m.Bytes))
+    if ($m.Encrypted) { Write-Log ((T '   зашифрована паролем (7-Zip, AES-256): {0}, {1}') -f $m.Archive, (Format-Size ([long]$m.ArchiveBytes))) }
     foreach ($i in @($m.Items)) { Write-ItemLog $i }
     foreach ($r in @($m.Restores | Where-Object { $_ })) {
-        Write-Log ('   развёрнута на {0} {1}, {2}, итог: {3}' -f $r.PC, ([datetime]$r.Date).ToString('dd.MM.yyyy HH:mm'), $r.Operator, $r.Status)
+        Write-Log ((T '   развёрнута на {0} {1}, {2}, итог: {3}') -f $r.PC, ([datetime]$r.Date).ToString($script:DateFmt), $r.Operator, $r.Status)
         foreach ($i in @($r.Items)) { Write-ItemLog $i }
     }
 }
@@ -2069,9 +2105,9 @@ function Show-Update($C) {
     if (-not $v -or $v -le [version]$script:AppVersion) { return }
     $url = [string]$C.Url
     if ($url -notmatch '^https://github\.com/') { $url = 'https://github.com/{0}/releases/latest' -f $C.Repo }
-    Write-Log ('Вышла новая версия {0} (у вас {1}): {2}' -f $v, $script:AppVersion, $url) 'warn'
+    Write-Log ((T 'Вышла новая версия {0} (у вас {1}): {2}') -f $v, $script:AppVersion, $url) 'warn'
     if ($script:UpdateLink) {
-        $script:UpdateLink.Text = 'Вышла версия {0}: скачать' -f $v
+        $script:UpdateLink.Text = (T 'Вышла версия {0}: скачать') -f $v
         $script:UpdateLink.Tag = $url
         $script:UpdateLink.Visible = $true
     }
@@ -2088,8 +2124,8 @@ function Invoke-Guarded([scriptblock]$Action) {
     Set-Busy $true
     try { & $Action }
     catch {
-        Write-Log ('ОШИБКА: ' + $_.Exception.Message) 'err'
-        if (-not $script:Aborting) { [void](Show-Msg ($_.Exception.Message + "`r`n`r`nЖурнал: $($script:LogFile)") 'Error') }
+        Write-Log ((T 'ОШИБКА: ') + $_.Exception.Message) 'err'
+        if (-not $script:Aborting) { [void](Show-Msg ($_.Exception.Message + "`r`n`r`n" + ((T 'Журнал: {0}') -f $script:LogFile)) 'Error') }
     }
     finally { Set-Busy $false }
 }
@@ -2097,6 +2133,8 @@ function Invoke-Guarded([scriptblock]$Action) {
 function New-Btn([string]$Text, [int]$Width, [scriptblock]$OnClick) {
     $b = New-Object Windows.Forms.Button
     $b.Text = $Text; $b.Width = $Width; $b.Height = 30
+    # перевод может быть длиннее: кнопка растёт по тексту, но не уже заданной ширины
+    $b.MinimumSize = New-Object Drawing.Size($Width, 30); $b.AutoSize = $true; $b.AutoSizeMode = 'GrowOnly'
     $b.Add_Click($OnClick)
     $script:Buttons += $b
     $b
@@ -2107,7 +2145,7 @@ if ($NoGui) { return }
 try {
     $form = New-Object Windows.Forms.Form
     $script:MainForm = $form
-    $form.Text = 'Перенос профиля сотрудника на другой ПК'
+    $form.Text = (T 'Перенос профиля сотрудника на другой ПК')
     $form.ClientSize = New-Object Drawing.Size(1100, 680)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object Drawing.Font('Segoe UI', 9)
@@ -2116,21 +2154,25 @@ try {
     $top.Dock = 'Top'; $top.AutoSize = $true; $top.AutoSizeMode = 'GrowAndShrink'; $top.WrapContents = $true
     $top.Padding = New-Object Windows.Forms.Padding(6, 6, 6, 0)
     $btns = @(
-        (New-Btn 'Перенести сразу…' 135 { Invoke-Guarded { Show-MoveDialog } })
-        (New-Btn 'Снять с ПК…' 110 { Invoke-Guarded { Show-CaptureDialog } })
-        (New-Btn 'Развернуть на ПК…' 140 { Invoke-Guarded { Show-RestoreDialog } })
-        (New-Btn 'Подробно' 90 { Invoke-Guarded { Show-CopyDetails } })
-        (New-Btn 'Акт' 60 { Invoke-Guarded { Show-ActForCopy } })
-        (New-Btn 'Удалить копию' 115 { Invoke-Guarded {
+        (New-Btn (T 'Перенести сразу…') 135 { Invoke-Guarded { Show-MoveDialog } })
+        (New-Btn (T 'Снять с ПК…') 110 { Invoke-Guarded { Show-CaptureDialog } })
+        (New-Btn (T 'Развернуть на ПК…') 140 { Invoke-Guarded { Show-RestoreDialog } })
+        (New-Btn (T 'Подробно') 90 { Invoke-Guarded { Show-CopyDetails } })
+        (New-Btn (T 'Акт') 60 { Invoke-Guarded { Show-ActForCopy } })
+        (New-Btn (T 'Удалить копию') 115 { Invoke-Guarded {
             $c = Get-SelectedCopy
-            if (-not $c) { throw 'Выберите копию в списке' }
-            if ((Show-Msg ('Удалить копию {0} ({1}) с {2} от {3}, {4}?{5}{5}Вернуть её будет нельзя (разве что из снимков или теневых копий хранилища).' -f $c.Name, $c.Login, $c.Pc, $c.When.ToString('dd.MM.yyyy HH:mm'), (Format-Size $c.Bytes), "`r`n") 'Warning' 'YesNo') -ne 'Yes') { return }
+            if (-not $c) { throw (T 'Выберите копию в списке') }
+            if ((Show-Msg ((T 'Удалить копию {0} ({1}) с {2} от {3}, {4}?{5}{5}Вернуть её будет нельзя (разве что из снимков или теневых копий хранилища).') -f $c.Name, $c.Login, $c.Pc, $c.When.ToString($script:DateFmt), (Format-Size $c.Bytes), "`r`n") 'Warning' 'YesNo') -ne 'Yes') { return }
             Remove-Copy $c
             Update-Grid
         } })
-        (New-Btn 'Обновить список' 120 { Invoke-Guarded { Update-Grid } })
-        (New-Btn 'Инструкция' 95 { Start-Process notepad.exe -ArgumentList ('"{0}"' -f (Join-Path $script:Root 'README.md')) })
-        (New-Btn 'Журналы' 85 { Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:LogDir) })
+        (New-Btn (T 'Обновить список') 120 { Invoke-Guarded { Update-Grid } })
+        (New-Btn (T 'Инструкция') 95 {
+            $doc = Join-Path $script:Root $(if ($script:Lang -eq 'en') { 'README.en.md' } else { 'README.md' })
+            if (-not (Test-Path -LiteralPath $doc)) { $doc = Join-Path $script:Root 'README.md' }
+            Start-Process notepad.exe -ArgumentList ('"{0}"' -f $doc)
+        })
+        (New-Btn (T 'Журналы') 85 { Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:LogDir) })
     )
     $top.Controls.AddRange([Windows.Forms.Control[]]$btns)
     $upd = New-Object Windows.Forms.LinkLabel
@@ -2143,7 +2185,7 @@ try {
 
     $info = New-Object Windows.Forms.Label
     $info.Dock = 'Top'; $info.Height = 24; $info.Padding = New-Object Windows.Forms.Padding(8, 4, 8, 0)
-    $info.Text = 'Чтение копий…'
+    $info.Text = (T 'Чтение копий…')
     $script:InfoLabel = $info
 
     $split = New-Object Windows.Forms.SplitContainer
@@ -2153,7 +2195,7 @@ try {
     $grid.Dock = 'Fill'; $grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false
     $grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false; $grid.RowHeadersVisible = $false
     $grid.AutoSizeColumnsMode = 'Fill'; $grid.BackgroundColor = [Drawing.SystemColors]::Window
-    foreach ($c in @(@('Login', 'Сотрудник', 80), @('Name', 'ФИО', 150), @('Pc', 'Снято с ПК', 90), @('When', 'Когда', 85), @('Size', 'Размер', 60), @('Status', 'Итог', 80), @('Restored', 'Развёрнуто на', 120))) {
+    foreach ($c in @(@('Login', (T 'Сотрудник'), 80), @('Name', (T 'ФИО'), 150), @('Pc', (T 'Снято с ПК'), 90), @('When', (T 'Когда'), 85), @('Size', (T 'Размер'), 60), @('Status', (T 'Итог'), 80), @('Restored', (T 'Развёрнуто на'), 120))) {
         $i = $grid.Columns.Add($c[0], $c[1])
         $grid.Columns[$i].FillWeight = $c[2]
     }
@@ -2171,13 +2213,13 @@ try {
 
     $form.Add_Shown({
         $split.SplitterDistance = 260
-        Write-Log ('Окно «Перенос профиля» ({0}): {1}\{2} на {3}, к ПК и хранилищу под {4}, журнал {5}' -f $script:Version, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME, $script:NetUser, $script:LogFile)
+        Write-Log ((T 'Окно «Перенос профиля» ({0}): {1}\{2} на {3}, к ПК и хранилищу под {4}, журнал {5}') -f $script:Version, $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME, $script:NetUser, $script:LogFile)
         $chk = Get-AdminCheck $script:Cfg
         if (-not $chk.AdminPc -or -not $chk.AdminUser) {
             $why = @()
-            if (-not $chk.AdminPc) { $why += ('{0} не ПК администратора' -f $chk.Pc) }
-            if (-not $chk.AdminUser) { $why += ('{0} не администратор' -f $chk.User) }
-            Write-Log ('   окно запущено не на ПК администратора: {0}. Пароль администратора домена введён здесь' -f ($why -join ', ')) 'warn'
+            if (-not $chk.AdminPc) { $why += ((T '{0} не ПК администратора') -f $chk.Pc) }
+            if (-not $chk.AdminUser) { $why += ((T '{0} не администратор') -f $chk.User) }
+            Write-Log ((T '   окно запущено не на ПК администратора: {0}. Пароль администратора домена введён здесь') -f ($why -join ', ')) 'warn'
         }
         Invoke-Guarded { Clear-Staging; Update-Grid; Invoke-Cleanup }
         try { Start-UpdateCheck } catch { }
@@ -2185,7 +2227,7 @@ try {
     $form.Add_FormClosing({
         param($s, $e)
         if ($script:Busy) {
-            if ((Show-Msg 'Идёт перенос. Закрыть окно всё равно? Копирование прервётся на середине, его можно будет повторить.' 'Warning' 'YesNo') -ne 'Yes') { $e.Cancel = $true; return }
+            if ((Show-Msg (T 'Идёт перенос. Закрыть окно всё равно? Копирование прервётся на середине, его можно будет повторить.') 'Warning' 'YesNo') -ne 'Yes') { $e.Cancel = $true; return }
             # robocopy и 7-Zip останавливаются, служба «Удалённый реестр» возвращается как была, временная папка стирается
             $script:Aborting = $true
         }
@@ -2196,5 +2238,5 @@ try {
     [void]$form.ShowDialog()
 }
 catch {
-    [System.Windows.Forms.MessageBox]::Show("Окно «Перенос профиля» не запустилось:`r`n$($_.Exception.Message)`r`n$($_.InvocationInfo.PositionMessage)", 'Перенос профиля', 'OK', 'Error') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show(((T 'Окно «Перенос профиля» не запустилось:{0}{1}{0}{2}') -f "`r`n", $_.Exception.Message, $_.InvocationInfo.PositionMessage), (T 'Перенос профиля'), 'OK', 'Error') | Out-Null
 }

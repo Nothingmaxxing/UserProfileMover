@@ -44,9 +44,10 @@ function Write-Log { param([string]$Text, [string]$Level = 'info') $script:LogLi
 function Show-Msg([string]$Text, [string]$Icon = 'Information', [string]$Buttons = 'OK') { $script:Shown = @{ Text = $Text; Icon = $Icon; Buttons = $Buttons }; return $script:MsgAnswer }
 $script:MsgAnswer = 'Cancel'
 
-. (Get-Fn 'Initialize-Browsers', 'Get-ExcludeArgs', 'Test-BrowserRunning', 'Wait-BrowserClosed', 'Get-BrowserJobs', 'Test-Locked',
+. (Get-Fn 'T', 'Set-Language', 'Initialize-Browsers', 'Get-ExcludeArgs', 'Test-BrowserRunning', 'Wait-BrowserClosed', 'Get-BrowserJobs', 'Test-Locked',
     'Get-ErrCode', 'New-ItemResult', 'Write-ItemLog', 'Get-CopyHas', 'Format-Size', 'Format-Span', 'Get-Worst', 'ConvertFrom-RoboError',
     'Invoke-Move', 'Show-Result', 'ConvertTo-HtmlText', 'Get-ActStatus', 'New-Act')
+Set-Language 'ru' $root   # проверки ниже ждут русские тексты
 
 # ---------------------------------------------------------------- 3. config.example.psd1 и браузеры
 
@@ -288,6 +289,88 @@ Show-Update ([pscustomobject]@{ Repo = 'a/b'; Tag = 'v1.5'; Url = 'https://githu
 Check 'обновление: та же версия, ссылки нет' (-not $script:UpdateLink.Visible)
 Show-Update ([pscustomobject]@{ Repo = 'a/b'; Tag = 'v1.6'; Url = 'http://example.com/x' })
 Check 'обновление: новая версия, ссылка только на GitHub' ($script:UpdateLink.Visible -and $script:UpdateLink.Tag -eq 'https://github.com/a/b/releases/latest' -and $script:UpdateLink.Text -like '*1.6*')
+
+# ---------------------------------------------------------------- 10. английский интерфейс (lang\en.psd1)
+
+$tr = Import-PowerShellDataFile (Join-Path $root 'lang/en.psd1')
+$keys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+$naked = New-Object System.Collections.Generic.List[string]
+foreach ($f in @('profile-move.ps1', 'start.ps1')) {
+    foreach ($c in $asts[$f].FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'T' }, $true)) {
+        $a = $c.CommandElements[1]
+        if ($a -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [void]$keys.Add($a.Value.TrimStart(' ')) }
+    }
+    # Русский текст вне T не переведётся: каждый литерал '...' с кириллицей должен быть первым аргументом T,
+    # в "..." кириллицы быть не должно (here-string @'...'@ с кодом C# не в счёт: там только комментарии)
+    foreach ($n in $asts[$f].FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $args[0].StringConstantType -eq 'SingleQuoted' -and $args[0].Value -match '[Ѐ-ӿ]' }, $true)) {
+        $p = $n.Parent
+        $inT = ($p -is [System.Management.Automation.Language.CommandAst] -and $p.GetCommandName() -eq 'T' -and $p.CommandElements[1] -eq $n)
+        if (-not $inT) { $naked.Add(('{0}:{1} {2}' -f $f, $n.Extent.StartLineNumber, $n.Value)) }
+    }
+    $tk = $null; $te = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root $f), [ref]$tk, [ref]$te)
+    foreach ($x in $tk) {
+        if ($x.Kind -in @('StringExpandable', 'HereStringExpandable') -and $x.Text -match '[Ѐ-ӿ]') { $naked.Add(('{0}:{1} {2}' -f $f, $x.Extent.StartLineNumber, $x.Text)) }
+    }
+}
+$cfgRu = Import-PowerShellDataFile (Join-Path $root 'config.example.psd1')
+foreach ($x in $cfgRu.Folders) { [void]$keys.Add([string]$x.Title) }
+foreach ($x in $cfgRu.Browsers) { [void]$keys.Add([string]$x.Title); if ($x.Note) { [void]$keys.Add([string]$x.Note) } }
+$need = @($keys | Where-Object { $_ -match '[^\x00-\x7F]' })
+foreach ($x in $naked) { Write-Host ('   без T: {0}' -f $x) }
+Check 'перевод: весь русский текст скриптов в T' ($naked.Count -eq 0)
+$miss = @($need | Where-Object { -not $tr.ContainsKey($_) })
+foreach ($x in $miss) { Write-Host ('   нет перевода: {0}' -f $x) }
+Check ('перевод: у всех {0} строк есть английский' -f $need.Count) ($need.Count -gt 300 -and $miss.Count -eq 0)
+$extra = @($tr.Keys | Where-Object { -not $keys.Contains($_) })
+foreach ($x in $extra) { Write-Host ('   лишний перевод: {0}' -f $x) }
+Check 'перевод: нет лишних строк' ($extra.Count -eq 0)
+$ph = '\{\d+(?::[^}]*)?\}'
+$badPh = @($tr.Keys | Where-Object {
+    $k = [string]$_; $v = [string]$tr[$_]
+    ((@([regex]::Matches($k, $ph) | ForEach-Object { $_.Value } | Sort-Object) -join ' ') -cne (@([regex]::Matches($v, $ph) | ForEach-Object { $_.Value } | Sort-Object) -join ' ')) -or
+    ($k.EndsWith(' ') -ne $v.EndsWith(' ')) -or ($v -match '[Ѐ-ӿ]') -or -not $v.Trim() })
+foreach ($x in $badPh) { Write-Host ('   не сходится: {0} = {1}' -f $x, $tr[$x]) }
+Check 'перевод: те же {0}, пробел в конце, без кириллицы' ($badPh.Count -eq 0)
+
+Set-Language 'en' $root
+Check 'язык en: перевод с отступом' ((T '   профиль: {0}{1}') -ceq '   profile: {0}{1}' -and $script:Lang -eq 'en')
+Check 'язык en: нет перевода, остаётся как есть' ((T 'Такой строки нет') -ceq 'Такой строки нет' -and (T 'Chromium-Gost') -ceq 'Chromium-Gost')
+Check 'язык en: даты' ($script:DateFmt -eq 'yyyy-MM-dd HH:mm' -and $script:DayFmt -eq 'yyyy-MM-dd')
+Check 'язык en: размер' ((Format-Size 3GB) -like '3?0 GB' -and (Format-Size 10) -eq '10 B')
+$ben = @(Initialize-Browsers $cfgRu)
+Check 'язык en: названия браузеров и примечания' ($ben[0].Title -eq 'Yandex Browser' -and $ben[2].Note -like 'Since version 127*')
+Set-Language 'xx' $root
+Check 'язык без файла перевода: русский' ($script:Lang -eq 'ru' -and (T 'Отмена') -ceq 'Отмена' -and $script:DateFmt -eq 'dd.MM.yyyy HH:mm')
+Set-Language 'ru' $root
+Check 'язык ru' ((T '   профиль: {0}{1}') -ceq '   профиль: {0}{1}')
+$fnSame = foreach ($n in @('T', 'Set-Language')) {
+    $x = @($asts['start.ps1'].FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $n }, $false))
+    ($x.Count -eq 1 -and $x[0].Extent.Text -ceq $all[$n])
+}
+Check 'T и Set-Language в start.ps1 такие же, как в profile-move.ps1' (@($fnSame | Where-Object { -not $_ }).Count -eq 0)
+
+# Английский пример настроек: те же параметры и пути, что в config.example.psd1 (свои названия, примечания и включённость)
+$cfgEn = Import-PowerShellDataFile (Join-Path $root 'config.example.en.psd1')
+Check 'config.example.en: те же параметры' (((@($cfgRu.Keys | Sort-Object) -join ',') -ceq (@($cfgEn.Keys | Sort-Object) -join ',')))
+$diff = New-Object System.Collections.Generic.List[string]
+foreach ($k in $cfgRu.Keys) {
+    if ($k -in @('Folders', 'Browsers', 'EnableCryptoPro')) { continue }
+    if ((@($cfgRu[$k]) -join '|') -cne (@($cfgEn[$k]) -join '|')) { $diff.Add($k) }
+}
+$fr = @($cfgRu.Folders | ForEach-Object { '{0}={1}' -f $_.Key, $_.Path }) -join ';'
+$fe = @($cfgEn.Folders | ForEach-Object { '{0}={1}' -f $_.Key, $_.Path }) -join ';'
+if ($fr -cne $fe) { $diff.Add('Folders') }
+$sig = { param($x) (@('UserData', 'Exe', 'LockFiles', 'ExcludeDirs', 'ExcludeFiles', 'Dpapi') | ForEach-Object { '{0}:{1}' -f $_, (@($x[$_]) -join '|') }) -join ';' }
+$br = @{}; foreach ($x in $cfgRu.Browsers) { $br[$x.Key] = & $sig $x }
+foreach ($x in $cfgEn.Browsers) { if (-not $br.ContainsKey($x.Key) -or $br[$x.Key] -cne (& $sig $x)) { $diff.Add('Browsers.' + $x.Key) } }
+if (@($cfgEn.Browsers).Count -ne @($cfgRu.Browsers).Count) { $diff.Add('Browsers') }
+foreach ($x in $diff) { Write-Host ('   отличается: {0}' -f $x) }
+Check 'config.example.en: значения и пути как в config.example.psd1' ($diff.Count -eq 0)
+Check 'config.example.en: включены Chrome, Edge, Firefox' ((@(Initialize-Browsers $cfgEn | ForEach-Object { $_.Key }) -join ',') -eq 'Chrome,Edge,Firefox')
+$readmeEn = [IO.File]::ReadAllText((Join-Path $root 'README.en.md'), [Text.Encoding]::UTF8)
+Check 'README.en: в «Versions» первой идёт AppVersion' ($readmeEn -match '## Versions\s+- \*\*([\d.]+)\*\*' -and $Matches[1] -eq $appVer)
+Check 'README.en: раздел «Preparing the storage»' ($readmeEn -match '(?m)^#+ Preparing the storage')
 
 # ----------------------------------------------------------------
 

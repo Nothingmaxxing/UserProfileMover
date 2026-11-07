@@ -5,8 +5,36 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.DirectoryServices.AccountManagement
 
+# Язык: такие же T и Set-Language в profile-move.ps1 (там описание)
+$script:Tr = @{}
+$script:Lang = 'ru'
+function T([string]$Text) {
+    if (-not $script:Tr.Count) { return $Text }
+    $k = $Text.TrimStart(' ')
+    $v = $script:Tr[$k]
+    if ($null -eq $v) { return $Text }
+    return $Text.Substring(0, $Text.Length - $k.Length) + $v
+}
+function Set-Language([string]$Lang, [string]$Root) {
+    if (-not $Lang -or $Lang -eq 'auto') {
+        $Lang = if ((Get-UICulture).TwoLetterISOLanguageName -eq 'ru' -or (Get-Culture).TwoLetterISOLanguageName -eq 'ru') { 'ru' } else { 'en' }
+    }
+    $script:Lang = 'ru'
+    $script:Tr = @{}
+    $f = Join-Path $Root ('lang\{0}.psd1' -f $Lang)
+    if ($Lang -ne 'ru' -and $Lang -match '^[a-z]{2}$' -and (Test-Path -LiteralPath $f)) {
+        $script:Tr = Import-PowerShellDataFile -LiteralPath $f
+        $script:Lang = $Lang
+    }
+    $ru = ($script:Lang -eq 'ru')
+    $script:DateFmt = if ($ru) { 'dd.MM.yyyy HH:mm' } else { 'yyyy-MM-dd HH:mm' }
+    $script:DayFmt = if ($ru) { 'dd.MM.yyyy' } else { 'yyyy-MM-dd' }
+    $script:ShortFmt = if ($ru) { 'dd.MM HH:mm' } else { 'MM-dd HH:mm' }
+}
+try { Set-Language 'auto' $PSScriptRoot } catch { Set-Language 'ru' $PSScriptRoot }
+
 function Show-StartError([string]$Text) {
-    [void][System.Windows.Forms.MessageBox]::Show($Text, 'Перенос профиля', 'OK', 'Error')
+    [void][System.Windows.Forms.MessageBox]::Show($Text, (T 'Перенос профиля'), 'OK', 'Error')
 }
 
 # Пароль проверяем у DC по IP из config.psd1, если он задан (VPN/прокси может подменять DNS, и DC по имени домена не находится),
@@ -22,7 +50,7 @@ function Test-AdLogin($Cfg, [string]$Sam, [string]$Pass) {
         finally { $ctx.Dispose() }
     }
     $m = if ($last) { $last.Message } else { '' }
-    throw ('Нет связи с контроллером домена ({0}), пароль не проверить: {1}' -f ($servers -join ', '), $m)
+    throw ((T 'Нет связи с контроллером домена ({0}), пароль не проверить: {1}') -f ($servers -join ', '), $m)
 }
 
 # ПК администратора или нет: OU компьютера берём из реестра самого ПК (его пишет групповая политика), без сети.
@@ -51,28 +79,29 @@ function Get-AdminCheck($Cfg) {
 try {
     $cfgPath = Join-Path $PSScriptRoot 'config.psd1'
     if (-not (Test-Path -LiteralPath $cfgPath)) {
-        throw ('Нет файла настроек {0}.{1}Скопируйте config.example.psd1 в config.psd1 и укажите в нём StoreRoot (см. README.md).' -f $cfgPath, "`r`n")
+        throw ((T 'Нет файла настроек {0}.{1}Скопируйте config.example.psd1 в config.psd1 и укажите в нём StoreRoot (см. README.md).') -f $cfgPath, "`r`n")
     }
     $cfg = Import-PowerShellDataFile -Path $cfgPath
-    if (-not $cfg.StoreRoot -or $cfg.StoreRoot -like '*example*') { throw 'В config.psd1 не указан StoreRoot: папка для копий.' }
+    Set-Language ([string]$cfg.Language) $PSScriptRoot
+    if (-not $cfg.StoreRoot -or $cfg.StoreRoot -like '*example*') { throw (T 'В config.psd1 не указан StoreRoot: папка для копий.') }
     if (-not $cfg.Domain) { $cfg.Domain = $env:USERDNSDOMAIN }
-    if (-not $cfg.Domain) { throw 'ПК не в домене AD, или в config.psd1 не указан Domain.' }
+    if (-not $cfg.Domain) { throw (T 'ПК не в домене AD, или в config.psd1 не указан Domain.') }
     $main = Join-Path $PSScriptRoot 'profile-move.ps1'
-    if (-not (Test-Path -LiteralPath $main)) { throw "Нет файла $main" }
+    if (-not (Test-Path -LiteralPath $main)) { throw ((T 'Нет файла {0}') -f $main) }
 
     # Не ПК администратора или сеанс сотрудника: предупредить до того, как вводить пароль
     $chk = Get-AdminCheck $cfg
     if (-not $chk.AdminPc -or -not $chk.AdminUser) {
         $n = "`r`n"
-        $where = if ($cfg.AdminPcOu) { 'не в OU «{0}»' -f (($cfg.AdminPcOu -split ',')[0] -replace '^OU=', '') } else { 'не в списке AdminPCs' }
-        $t = 'Окно запущено не на ПК администратора.' + $n + $n
-        $t += if ($chk.AdminPc) { 'ПК {0}: ПК администратора.' -f $chk.Pc } else { 'ПК {0}: {1}, это не ПК администратора.' -f $chk.Pc, $where }
+        $where = if ($cfg.AdminPcOu) { (T 'не в OU «{0}»') -f (($cfg.AdminPcOu -split ',')[0] -replace '^OU=', '') } else { (T 'не в списке AdminPCs') }
+        $t = (T 'Окно запущено не на ПК администратора.') + $n + $n
+        $t += if ($chk.AdminPc) { (T 'ПК {0}: ПК администратора.') -f $chk.Pc } else { (T 'ПК {0}: {1}, это не ПК администратора.') -f $chk.Pc, $where }
         $t += $n
-        $t += if ($chk.AdminUser) { 'Windows: {0}, администратор.' -f $chk.User } else { 'Windows: {0}, не администратор (сеанс сотрудника?).' -f $chk.User }
-        $t += $n + $n + 'Пароль администратора домена, введённый на чужом ПК или в сеансе сотрудника, могут перехватить программы этого ПК. '
-        $t += 'Сидеть за ПК сотрудника не нужно: окно ходит к его ПК по сети. Лучше закрыть и запустить окно со своего ПК.' + $n + $n
-        $t += 'Всё равно продолжить и ввести пароль здесь?'
-        if ([System.Windows.Forms.MessageBox]::Show($t, 'Перенос профиля', 'YesNo', 'Warning', 'Button2') -ne 'Yes') { return }
+        $t += if ($chk.AdminUser) { (T 'Windows: {0}, администратор.') -f $chk.User } else { (T 'Windows: {0}, не администратор (сеанс сотрудника?).') -f $chk.User }
+        $t += $n + $n + (T 'Пароль администратора домена, введённый на чужом ПК или в сеансе сотрудника, могут перехватить программы этого ПК. ')
+        $t += (T 'Сидеть за ПК сотрудника не нужно: окно ходит к его ПК по сети. Лучше закрыть и запустить окно со своего ПК.') + $n + $n
+        $t += (T 'Всё равно продолжить и ввести пароль здесь?')
+        if ([System.Windows.Forms.MessageBox]::Show($t, (T 'Перенос профиля'), 'YesNo', 'Warning', 'Button2') -ne 'Yes') { return }
     }
 
     Add-Type -TypeDefinition @'
@@ -135,17 +164,17 @@ public static class PmNetOnly {
     if (-not $lastUser) { $lastUser = $env:USERDOMAIN + '\' }
 
     while ($true) {
-        $c = Get-Credential -UserName $lastUser -Message ('Перенос профиля: доменная учётка администратора ПК (доступ к C$ на ПК{0})' -f $(if ($cfg.StoreRoot -like '\\*') { ' и к ' + $cfg.StoreRoot } else { '' }))
+        $c = Get-Credential -UserName $lastUser -Message ((T 'Перенос профиля: доменная учётка администратора ПК (доступ к C$ на ПК{0})') -f $(if ($cfg.StoreRoot -like '\\*') { (T ' и к ') + $cfg.StoreRoot } else { '' }))
         if (-not $c) { return }
         $name = $c.UserName.Trim().TrimStart('\')
         $pass = $c.GetNetworkCredential().Password
         if ($name -match '^(?<d>[^\\]+)\\(?<u>.+)$') { $dom = $Matches['d']; $usr = $Matches['u']; $sam = $usr }
         elseif ($name -match '@') { $dom = $null; $usr = $name; $sam = ($name -split '@')[0] }
         else { $dom = $env:USERDOMAIN; $usr = $name; $sam = $name }
-        if (-not $usr -or -not $pass) { Show-StartError 'Нужны логин и пароль.'; continue }
+        if (-not $usr -or -not $pass) { Show-StartError (T 'Нужны логин и пароль.'); continue }
 
         if (Test-AdLogin $cfg $sam $pass) { break }
-        Show-StartError 'Неверный логин или пароль. Попробуйте ещё раз.'
+        Show-StartError (T 'Неверный логин или пароль. Попробуйте ещё раз.')
         $lastUser = $name
     }
 
@@ -160,5 +189,5 @@ public static class PmNetOnly {
     [void][PmNetOnly]::Start($usr, $dom, $pass, $cmd, $PSScriptRoot)
 }
 catch {
-    Show-StartError "Окно «Перенос профиля» не запустилось:`r`n$($_.Exception.Message)`r`n$($_.InvocationInfo.PositionMessage)"
+    Show-StartError ((T 'Окно «Перенос профиля» не запустилось:{0}{1}{0}{2}') -f "`r`n", $_.Exception.Message, $_.InvocationInfo.PositionMessage)
 }
