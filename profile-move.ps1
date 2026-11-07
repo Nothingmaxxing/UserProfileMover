@@ -7,6 +7,7 @@
 #    (папка «Директория» и контейнеры из реестра), личные сертификаты
 #    → <StoreRoot>\<логин>\<дата>_<время>_<ПК>.
 #  - «Развернуть на ПК»: то же обратно в профиль сотрудника на новом ПК (сотрудник должен один раз войти туда).
+#  - «Перенести сразу»: оба шага подряд, когда старый и новый ПК включены.
 # На старом ПК ничего не удаляется и не меняется. Для реестра ПК окно на время работы включает службу
 # «Удалённый реестр» и потом возвращает её как было. Пароли и куки браузеров на Chromium переносятся вместе
 # с ключами DPAPI: учётка доменная, SID тот же, поэтому на новом ПК Windows их расшифрует.
@@ -1015,7 +1016,9 @@ function Get-LongPathText {
     return $t
 }
 
-function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups) {
+# Снять копию. $Resolved: ПК, уже найденный и проверенный (Resolve-Pc и Test-PcAccess), для «Перенести сразу».
+# Сообщение не показывает: возвращает итог (Status, Head, LongText) и копию (Path), сообщение собирает тот, кто вызвал
+function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups, $Resolved = $null) {
     $t0 = Get-Date
     $script:LongPaths.Clear()
     Write-Log ('=== Снять с ПК: {0} с {1}' -f $Login, $PcName) 'head'
@@ -1024,8 +1027,11 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups) {
     Test-Store
     $free = [PmDisk]::Free($script:Cfg.StoreRoot)
     if ($free -lt [long]$script:Cfg.MinNasFreeGB * 1GB) { throw ('В хранилище копий свободно {0}, нужно хотя бы {1} ГБ' -f (Format-Size $free), $script:Cfg.MinNasFreeGB) }
-    $pc = Resolve-Pc $PcName
-    Test-PcAccess $pc
+    if ($Resolved) { $pc = $Resolved }
+    else {
+        $pc = Resolve-Pc $PcName
+        Test-PcAccess $pc
+    }
     Write-Log ('   ПК {0} ({1}) {2}: доступ есть' -f $pc.Name, $pc.Host, $pc.Os)
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -1096,11 +1102,15 @@ function Invoke-Capture([string]$Login, [string]$PcName, [string[]]$Groups) {
     $st = Get-Worst $results
     $lvl = if ($st -eq 'ok') { 'ok' } else { 'warn' }
     Write-Log ('=== Снято: {0}, {1}, за {2}{3}' -f $user.Login, (Format-Size $m.Bytes), (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { '. Есть замечания, см. выше' } else { '' })) $lvl
-    $txt = 'Копия снята: {0} ({1}) с {2}, {3}.{4}{4}' -f $user.Name, $user.Login, $pc.Name, (Format-Size $m.Bytes), "`r`n"
-    if ($st -ne 'ok') { $txt += 'Есть замечания: см. журнал в окне.' + "`r`n`r`n" }
-    $txt += Get-LongPathText
-    $txt += 'Дальше: сотрудник один раз входит в Windows на новом ПК, потом в этом окне «Развернуть на ПК».'
-    [void](Show-Msg $txt $(if ($st -eq 'ok') { 'Information' } else { 'Warning' }))
+    return [pscustomobject]@{
+        Path     = $dir
+        Status   = $st
+        User     = $user
+        Pc       = $pc
+        Bytes    = [long]$m.Bytes
+        Head     = ('Копия снята: {0} ({1}) с {2}, {3}.' -f $user.Name, $user.Login, $pc.Name, (Format-Size $m.Bytes))
+        LongText = (Get-LongPathText)
+    }
 }
 
 # ---------------------------------------------------------------- Развернуть на ПК
@@ -1110,7 +1120,8 @@ function Get-CopyHas($M, [string]$Key) {
     return ($i -and ($i.Status -in @('ok', 'warn')))
 }
 
-function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
+# Развернуть копию. $Resolved: как у Invoke-Capture. Возвращает итог (Status, Head, LongText, Checks)
+function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups, $Resolved = $null) {
     $t0 = Get-Date
     $script:LongPaths.Clear()
     $m = Read-Manifest $Copy.Path
@@ -1119,8 +1130,11 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
     if ($m.Status -eq 'running') { Write-Log '   копия была прервана: развернётся то, что успело скопироваться' 'warn' }
     $user = Get-PmUser ([string]$m.Login)
     if ($user.Sid -ne [string]$m.Sid) { throw ('SID сотрудника в AD ({0}) не совпадает с копией ({1}): учётку пересоздавали? Пароли браузера так не перенести' -f $user.Sid, $m.Sid) }
-    $pc = Resolve-Pc $PcName
-    Test-PcAccess $pc
+    if ($Resolved) { $pc = $Resolved }
+    else {
+        $pc = Resolve-Pc $PcName
+        Test-PcAccess $pc
+    }
     Write-Log ('   ПК {0} ({1}) {2}: доступ есть' -f $pc.Name, $pc.Host, $pc.Os)
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -1232,9 +1246,7 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
     $st = Get-Worst $results
     Write-Log ('=== Развёрнуто: {0} на {1} за {2}{3}' -f $user.Login, $pc.Name, (Format-Span ((Get-Date) - $t0)), $(if ($st -ne 'ok') { '. Есть замечания, см. выше' } else { '' })) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
     $n = "`r`n"
-    $txt = 'Готово: {0} ({1}) на {2}.{3}{3}' -f $user.Name, $user.Login, $pc.Name, $n
-    if ($st -ne 'ok') { $txt += 'Есть замечания: см. журнал в окне.' + $n + $n }
-    $txt += Get-LongPathText
+    $txt = ''
     $done = @{}
     foreach ($i in $results) { if ($i.Status -in @('ok', 'warn')) { $done[[string]$i.Key] = $true } }
     $checks = New-Object System.Collections.Generic.List[string]
@@ -1252,7 +1264,60 @@ function Invoke-Restore($Copy, [string]$PcName, [string[]]$Groups) {
         for ($j = 0; $j -lt $checks.Count; $j++) { $txt += ('{0}. {1}' -f ($j + 1), $checks[$j]) + $n }
     }
     if ($doneB.Count) { $txt += $n + ('Если пароли не открылись: экспорт паролей в CSV на старом ПК и импорт на новом. Если браузер был открыт во время переноса, закрыть и открыть. Копия хранится {0} дней.' -f $script:Cfg.RetentionDays) }
-    [void](Show-Msg $txt $(if ($st -eq 'ok') { 'Information' } else { 'Warning' }))
+    return [pscustomobject]@{
+        Status   = $st
+        User     = $user
+        Pc       = $pc
+        Head     = ('Готово: {0} ({1}) на {2}.' -f $user.Name, $user.Login, $pc.Name)
+        LongText = (Get-LongPathText)
+        Checks   = $txt
+    }
+}
+
+# ---------------------------------------------------------------- Перенести сразу
+
+# Снять со старого ПК и сразу развернуть на новом. Оба ПК проверяем до снятия: без профиля сотрудника
+# на новом ПК развернуть некуда, и снимать копию тогда незачем
+function Invoke-Move([string]$Login, [string]$OldPc, [string]$NewPc, [string[]]$Groups) {
+    $t0 = Get-Date
+    Write-Log ('=== Перенести сразу: {0} с {1} на {2}' -f $Login, $OldPc, $NewPc) 'head'
+    $user = Get-PmUser $Login
+    $pcOld = Resolve-Pc $OldPc
+    Test-PcAccess $pcOld
+    $pcNew = Resolve-Pc $NewPc
+    Test-PcAccess $pcNew
+    if ($pcOld.Host -eq $pcNew.Host -or $pcOld.Name -ieq $pcNew.Name) {
+        throw ('Старый и новый ПК: один и тот же компьютер ({0}). Чтобы вернуть данные на тот же ПК (например, после переустановки Windows), снимите копию кнопкой «Снять с ПК», а потом «Развернуть на ПК»' -f $pcNew.Name)
+    }
+    try { $profNew = Find-UserProfile $pcNew $user } finally { Restore-RemoteRegistry }
+    if (-not $profNew.Unc) { throw ('Сотрудник ещё не входил на {0}: профиля нет. Пусть войдёт в Windows один раз, потом снова «Перенести сразу». Копия ещё не снималась' -f $pcNew.Name) }
+    Write-Log ('   новый ПК {0} ({1}): доступ есть, профиль {2}' -f $pcNew.Name, $pcNew.Host, $profNew.Local)
+
+    $cap = Invoke-Capture $Login $OldPc $Groups $pcOld
+    try { $res = Invoke-Restore ([pscustomobject]@{ Path = $cap.Path }) $NewPc $Groups $pcNew }
+    catch {
+        throw ('Копия снята, но развернуть на {0} не удалось: {1}{2}{2}Копия лежит в хранилище: когда причина будет устранена, выберите её в списке и нажмите «Развернуть на ПК».' -f $pcNew.Name, $_.Exception.Message, "`r`n")
+    }
+    $st = Get-Worst @($cap, $res)
+    $span = Format-Span ((Get-Date) - $t0)
+    Write-Log ('=== Перенесено: {0} с {1} на {2}, {3}, за {4}' -f $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span) $(if ($st -eq 'ok') { 'ok' } else { 'warn' })
+    return [pscustomobject]@{
+        Status   = $st
+        Head     = ('Перенесено: {0} ({1}) с {2} на {3}, {4} за {5}.' -f $user.Name, $user.Login, $pcOld.Name, $pcNew.Name, (Format-Size $cap.Bytes), $span)
+        LongText = ($cap.LongText + $res.LongText)
+        Checks   = $res.Checks
+    }
+}
+
+# Итоговое сообщение: заголовок, замечания, не скопированные из-за длинного имени, что проверить, что дальше
+function Show-Result($R, [string]$Tail = '') {
+    $n = "`r`n"
+    $txt = $R.Head + $n + $n
+    if ($R.Status -ne 'ok') { $txt += 'Есть замечания: см. журнал в окне.' + $n + $n }
+    $txt += $R.LongText
+    if ($R.PSObject.Properties['Checks'] -and $R.Checks) { $txt += $R.Checks }
+    if ($Tail) { $txt += $Tail }
+    [void](Show-Msg $txt.TrimEnd() $(if ($R.Status -eq 'ok') { 'Information' } else { 'Warning' }))
 }
 
 # ---------------------------------------------------------------- окна
@@ -1334,7 +1399,8 @@ function Show-CaptureDialog {
     })
     if ($f.ShowDialog($script:MainForm) -ne 'OK') { return }
     $f.Dispose()
-    Invoke-Capture $st.Login $st.Pc $st.Groups
+    $r = Invoke-Capture $st.Login $st.Pc $st.Groups
+    Show-Result $r 'Дальше: сотрудник один раз входит в Windows на новом ПК, потом в этом окне «Развернуть на ПК».'
 }
 
 function Show-RestoreDialog {
@@ -1398,7 +1464,38 @@ function Show-RestoreDialog {
     & $fill
     if ($f.ShowDialog($script:MainForm) -ne 'OK') { return }
     $f.Dispose()
-    Invoke-Restore $st.Copy $st.Pc $st.Groups
+    $r = Invoke-Restore $st.Copy $st.Pc $st.Groups
+    Show-Result $r
+}
+
+function Show-MoveDialog {
+    $f = New-Dialog 'Перенести сразу: со старого ПК на новый' 460 360
+    [void](New-Label $f 'Логин сотрудника в AD (например, ivanov_ii):' 12 12)
+    $tLogin = New-Text $f 12 32
+    [void](New-Label $f 'Старый ПК: имя (например, PC-042) или IP:' 12 66)
+    $tOld = New-Text $f 12 86
+    [void](New-Label $f 'Новый ПК: имя или IP (сотрудник уже входил на него):' 12 120)
+    $tNew = New-Text $f 12 140
+    [void](New-Label $f 'Что перенести:' 12 176)
+    $gc = Add-GroupChecks $f 196
+    $checks = $gc.Checks
+    $f.ClientSize = New-Object Drawing.Size(460, ($gc.Bottom + 78))
+    $ok = Add-DialogButtons $f 'Перенести' ($gc.Bottom + 32)
+    $st = @{}
+    $ok.Add_Click({
+        $err = ''
+        if ($tLogin.Text.Trim() -notmatch '^[A-Za-z0-9._-]{1,64}$') { $err = 'Введите логин сотрудника (латиницей, как в AD).' }
+        elseif (-not $tOld.Text.Trim()) { $err = 'Введите имя старого ПК.' }
+        elseif (-not $tNew.Text.Trim()) { $err = 'Введите имя нового ПК.' }
+        elseif ($tOld.Text.Trim() -ieq $tNew.Text.Trim()) { $err = 'Старый и новый ПК совпадают. Чтобы вернуть данные на тот же ПК, используйте «Снять с ПК» и «Развернуть на ПК».' }
+        elseif (-not (Get-GroupChecks $checks).Count) { $err = 'Отметьте, что перенести.' }
+        if ($err) { [void](Show-Msg $err 'Warning'); $f.DialogResult = 'None'; return }
+        $st.Login = $tLogin.Text.Trim(); $st.Old = $tOld.Text.Trim(); $st.New = $tNew.Text.Trim(); $st.Groups = Get-GroupChecks $checks
+    })
+    if ($f.ShowDialog($script:MainForm) -ne 'OK') { $f.Dispose(); return }
+    $f.Dispose()
+    $r = Invoke-Move $st.Login $st.Old $st.New $st.Groups
+    Show-Result $r
 }
 
 function Show-CopyDetails {
@@ -1454,6 +1551,7 @@ try {
     $top.Dock = 'Top'; $top.AutoSize = $true; $top.AutoSizeMode = 'GrowAndShrink'; $top.WrapContents = $true
     $top.Padding = New-Object Windows.Forms.Padding(6, 6, 6, 0)
     $btns = @(
+        (New-Btn 'Перенести сразу…' 135 { Invoke-Guarded { Show-MoveDialog } })
         (New-Btn 'Снять с ПК…' 110 { Invoke-Guarded { Show-CaptureDialog } })
         (New-Btn 'Развернуть на ПК…' 140 { Invoke-Guarded { Show-RestoreDialog } })
         (New-Btn 'Подробно' 90 { Invoke-Guarded { Show-CopyDetails } })
