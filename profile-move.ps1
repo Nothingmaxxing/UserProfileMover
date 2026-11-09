@@ -61,6 +61,59 @@ function Set-Language([string]$Lang, [string]$Root) {
 }
 try { Set-Language 'auto' $script:Root } catch { Set-Language 'ru' $script:Root }
 
+# Настройки: defaults.psd1 (всё по умолчанию, при обновлении заменяется), поверх него config.psd1 (своё).
+# Folders и Browsers в config.psd1: ключи из defaults.psd1 ('Desktop', 'Chrome') и свои блоки @{ Key = ... }; блок
+# с ключом из defaults.psd1 меняет только указанные в нём поля. Нет списка в config.psd1: всё, кроме Enabled = $false.
+# Неизвестная настройка в config.psd1 (опечатка) = ошибка. Такие же Merge-Config и Read-Config в start.ps1
+function Merge-Config($Defaults, $Own) {
+    $legacy = @('YandexPath', 'EnableYandex', 'YandexExcludeDirs', 'YandexExcludeFiles', 'YandexExe')   # config.psd1 до 1.4
+    foreach ($k in @($Own.Keys)) {
+        if (-not $Defaults.ContainsKey($k) -and $legacy -notcontains $k) { throw ((T 'неизвестная настройка «{0}» (опечатка?). Все настройки с пояснениями: defaults.psd1') -f $k) }
+    }
+    $cfg = $Defaults.Clone()
+    foreach ($k in @($Own.Keys)) { $cfg[$k] = $Own[$k] }
+    foreach ($list in @('Folders', 'Browsers')) {
+        $cat = @{}
+        $order = @()
+        foreach ($d in @($Defaults[$list] | Where-Object { $_ })) { $cat[[string]$d.Key] = $d; $order += [string]$d.Key }
+        if (-not $Own.ContainsKey($list)) {
+            $cfg[$list] = @($order | ForEach-Object { $cat[$_] } | Where-Object { $_.Enabled -ne $false })
+            continue
+        }
+        $items = foreach ($e in @($Own[$list] | Where-Object { $_ })) {
+            if ($e -is [string]) {
+                if (-not $cat.ContainsKey($e)) { throw ((T '{0}: «{1}» нет в defaults.psd1, есть: {2}') -f $list, $e, ($order -join ', ')) }
+                $h = $cat[$e].Clone(); $h.Remove('Enabled'); $h
+            } elseif ($e -is [hashtable]) {
+                $k = [string]$e.Key
+                if ($k -and $cat.ContainsKey($k)) { $h = $cat[$k].Clone(); $h.Remove('Enabled'); foreach ($n in @($e.Keys)) { $h[$n] = $e[$n] }; $h } else { $e }
+            } else { throw ((T '{0}: «{1}» должен быть ключом в кавычках или блоком @{{ Key = ... }}') -f $list, $e) }
+        }
+        # браузеры с Enabled = $false остаются: их Key проверяет Initialize-Browsers
+        $cfg[$list] = @($items | Where-Object { $_ -and ($list -eq 'Browsers' -or $_.Enabled -ne $false) })
+    }
+    $seen = @{}
+    foreach ($f in $cfg.Folders) {
+        $k = [string]$f.Key
+        if ($k -notmatch '^[A-Za-z0-9]+$') { throw ((T 'папка «{0}»: Key должен быть из латинских букв и цифр, а он «{1}»') -f $f.Title, $k) }
+        if ($seen.ContainsKey($k)) { throw ((T 'папка «{0}»: Key «{1}» повторяется') -f $f.Title, $k) }
+        if (-not $f.Path) { throw ((T 'папка «{0}»: не указан Path') -f $f.Title) }
+        $seen[$k] = $true
+    }
+    if (-not $Own.ContainsKey('Browsers') -and $Own.YandexPath) { $cfg.Remove('Browsers') }   # до 1.4: один Яндекс из YandexPath
+    return $cfg
+}
+
+function Read-Config([string]$Dir) {
+    $def = Join-Path $Dir 'defaults.psd1'
+    if (-not (Test-Path -LiteralPath $def)) { throw ((T 'Нет файла {0} с настройками по умолчанию: распакуйте ZIP с окном целиком.') -f $def) }
+    $own = Join-Path $Dir 'config.psd1'
+    if (-not (Test-Path -LiteralPath $own)) {
+        throw ((T 'Нет файла настроек {0}.{1}Скопируйте config.example.psd1 в config.psd1 и укажите в нём StoreRoot (см. README.md).') -f $own, "`r`n")
+    }
+    return (Merge-Config (Import-PowerShellDataFile -LiteralPath $def) (Import-PowerShellDataFile -LiteralPath $own))
+}
+
 # Браузеры из config.psd1 с настройками по умолчанию. В config.psd1 до версии 1.4 браузер один: Яндекс из YandexPath
 function Initialize-Browsers($Cfg) {
     $chDirs = @('Cache', 'Code Cache', 'GPUCache', 'GrShaderCache', 'GraphiteDawnCache', 'ShaderCache',
@@ -111,7 +164,7 @@ function Find-7z($Cfg) {
 
 # Ошибку в config.psd1 показываем окном: этот скрипт запускается без консоли
 try {
-    $script:Cfg = Import-PowerShellDataFile -Path (Join-Path $script:Root 'config.psd1')
+    $script:Cfg = Read-Config $script:Root
     Set-Language ([string]$script:Cfg.Language) $script:Root
     if (-not $script:Cfg.Domain) { $script:Cfg.Domain = $env:USERDNSDOMAIN }
     if ($null -eq $script:Cfg.EnableCryptoPro) { $script:Cfg.EnableCryptoPro = $true }
@@ -130,8 +183,8 @@ $script:LogDir = Join-Path $script:Root 'logs'
 New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
 $script:LogFile = Join-Path $script:LogDir ('{0:yyyy-MM-dd}_{1}.log' -f (Get-Date), $env:COMPUTERNAME)
 $script:NetUser = if ($NetUser) { $NetUser } else { '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME }
-$script:AppVersion = '1.5'   # сравнивается с последним релизом на GitHub (тег v1.5)
-$script:Version = 'profile-move 1.5 (08.11.2026)'
+$script:AppVersion = '1.5.1'   # сравнивается с последним релизом на GitHub (тег v1.5.1)
+$script:Version = 'profile-move 1.5.1 (09.11.2026)'
 $script:UpdateLink = $null
 $script:Upd = $null
 $script:AppTitle = (T 'Перенос профиля')
