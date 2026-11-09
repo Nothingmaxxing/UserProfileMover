@@ -27,7 +27,7 @@ Nothing is deleted or changed on the old PC. You can capture a copy in advance, 
 The user's DPAPI keys (`AppData\Roaming\Microsoft\Protect\<SID>`) are always transferred together with Chromium-based browsers and signatures.
 Passwords and cookies of Chrome, Edge and other Chromium-based browsers are encrypted with these keys. The account is a domain account and the user's SID stays the same, so Windows on the new PC decrypts them: no need to export passwords to CSV. Firefox encrypts passwords with its own key (`key4.db`), which moves together with the profile.
 
-`desktop.ini`, `Thumbs.db`, `~$*` and `*.tmp` are not transferred. In `config.psd1` you can add your own folders (`Folders`: there are ready-made lines for Outlook signatures and Word templates) and browsers (`Browsers`), turn browsers on and off (`Enabled`) and the signatures (`EnableCryptoPro`). Each browser and each folder gets its own checkbox in the window.
+`desktop.ini`, `Thumbs.db`, `~$*` and `*.tmp` are not transferred. What to transfer is set in `config.psd1` with lists of keys: `Folders = @('Desktop', 'Documents', 'Downloads')`, `Browsers = @('Chrome', 'Firefox')`, and `EnableCryptoPro` for signatures. Ready-made folders you only need to add to `Folders`: `Signatures` (Outlook signatures), `OfficeTpl` (Word templates), `Ibases1C` (1C database list), `Pictures`, `Favorites`. Your own folder or browser can be added as a block in the same list (see "Settings" and "Add your own browser"). Each browser and each folder gets its own checkbox in the window.
 
 In the English example config (`config.example.en.psd1`), Chrome, Edge and Firefox are on, while Yandex Browser, Chromium-Gost and CryptoPro (common in Russia) are off.
 
@@ -45,12 +45,43 @@ In the English example config (`config.example.en.psd1`), Chrome, Edge and Firef
 
 1. Download the ZIP of the latest version from [Releases](https://github.com/Nothingmaxxing/UserProfileMover/releases) (or Code → Download ZIP) and extract it to a folder users cannot write to: for example, an IT share or `C:\Tools\profile-move` on the admin PC.
    Remove the "downloaded from the internet" mark: `Get-ChildItem -Recurse | Unblock-File` in this folder.
-2. Copy `config.example.en.psd1` to `config.psd1` and set `StoreRoot` in it: a share, a folder or a USB drive (see "Preparing the storage"). The rest can stay as is:
+2. Copy `config.example.en.psd1` to `config.psd1` and set `StoreRoot` in it: a share, a folder or a USB drive (see "Preparing the storage"). The rest is optional:
    - `Domain` empty: the domain is taken from `%USERDNSDOMAIN%`;
    - `DcIp`: the domain controller IP, if a VPN client on the admin PC overrides DNS (198.18.x.x addresses);
    - `AdminPcOu`, `AdminPCs`, `AdminGroups`: for the "not running on an admin PC" warning;
-   - `Language`: `auto` (Russian on Russian Windows, English otherwise), `en` or `ru`.
+   - `Folders`, `Browsers`, `EnableCryptoPro`: what to transfer;
+   - `OrgName`: the organization name in the transfer report header.
+
+   Everything not set in `config.psd1` is taken from `defaults.psd1` (see "Settings").
 3. Run `profile-move.cmd` and enter the domain admin account. The list of copies in the storage opens.
+
+## Settings
+
+Settings live in two files next to the window:
+
+- `config.psd1`: only your own values. Example: `config.example.en.psd1` (with Russian comments: `config.example.psd1`).
+- `defaults.psd1`: all settings with their defaults and comments (in Russian). Do not edit it: updates replace it. To change a setting, copy its line to `config.psd1`.
+
+| Setting | Default | What it is |
+|---|---|---|
+| `StoreRoot` | none, required | where to keep the copies (see "Preparing the storage") |
+| `Domain` | the domain of this PC | AD domain DNS name |
+| `DcIp` | empty | domain controller IP, if a VPN or proxy overrides DNS |
+| `AdminPcOu`, `AdminPCs`, `AdminGroups` | empty | admin PCs and groups for the "not an admin PC" warning |
+| `Folders` | `Desktop`, `Documents`, `Downloads` | folders: keys from `defaults.psd1` and your own blocks `@{ Key = ...; Title = ...; Path = ... }` |
+| `Browsers` | all five | browsers: `Yandex`, `ChromiumGost`, `Chrome`, `Edge`, `Firefox` and your own blocks |
+| `EnableCryptoPro` | `$true` | CryptoPro CSP signatures and personal certificates |
+| `Language` | `auto` | window language: `auto`, `ru`, `en` (see "Language") |
+| `Act`, `OrgName` | `$true`, empty | transfer report and the organization in its header |
+| `Encrypt`, `SevenZip`, `StagingDir` | `Optional`, empty, empty | copy encryption (see "Copy encryption") |
+| `UpdateCheck`, `UpdateRepo` | `$true`, this repository | new version check (see "Updates") |
+| `RetentionDays` | 30 | copies older than this are offered for deletion at startup |
+| `MinNasFreeGB`, `TargetSpareGB` | 20, 2 | GB that must be free in the storage before a capture and on the new PC after a transfer |
+| `RoboThreads` | 8 | robocopy threads |
+| `FileExcludes`, `ChromiumExclude*`, `CryptoPro*`, `Certs*`, `DpapiPath` | see `defaults.psd1` | what not to copy and where things are in the profile |
+
+A block with a key from `defaults.psd1` changes only the fields it lists, for example `Browsers = @('Chrome', @{ Key = 'Firefox'; Exe = @('D:\Firefox\firefox.exe') })`. To drop a folder or browser, leave its key out of the list (or set `Enabled = $false` in a block).
+An unknown setting in `config.psd1` (for example, a typo like `AdminGroup`) stops the start with an error. A full `config.psd1` from versions 1.4 and 1.5 works as before.
 
 ## Move a user to another PC
 
@@ -159,20 +190,25 @@ USB drive: format it as NTFS (FAT32 cannot hold files over 4 GB, and exFAT canno
 
 ## Add your own browser
 
-Chromium-based browsers are built the same way, so a key and a profile folder are usually enough. Example for Brave and Vivaldi (typical paths, not tested in practice), add to `Browsers` in `config.psd1`:
+Chromium-based browsers are built the same way, so a key and a profile folder are usually enough. Example for Brave and Vivaldi (typical paths, not tested in practice): in `config.psd1` the blocks go into `Browsers` together with the keys of the browsers you need from `defaults.psd1`:
 
 ```powershell
-@{ Key = 'Brave';   Title = 'Brave';   UserData = @('AppData\Local\BraveSoftware\Brave-Browser\User Data') }
-@{ Key = 'Vivaldi'; Title = 'Vivaldi'; UserData = @('AppData\Local\Vivaldi\User Data') }
+Browsers = @(
+    'Chrome', 'Edge'
+    @{ Key = 'Brave';   Title = 'Brave';   UserData = @('AppData\Local\BraveSoftware\Brave-Browser\User Data') }
+    @{ Key = 'Vivaldi'; Title = 'Vivaldi'; UserData = @('AppData\Local\Vivaldi\User Data') }
+)
 ```
 
-Caches and the "browser is open" marker are taken from Chromium by default (`ChromiumExcludeDirs`, `ChromiumLockFiles`). For a browser not based on Chromium, set `Dpapi = $false` and your own `LockFiles` and `ExcludeDirs`, as for Firefox in the example.
+Caches and the "browser is open" marker are taken from Chromium by default (`ChromiumExcludeDirs`, `ChromiumLockFiles`). For a browser not based on Chromium, set `Dpapi = $false` and your own `LockFiles` and `ExcludeDirs`, as for Firefox in `defaults.psd1`.
 
 ## Troubleshooting
 
 | What you see | What to do |
 |---|---|
 | "Settings file config.psd1 not found" | Copy `config.example.en.psd1` to `config.psd1` and set `StoreRoot` |
+| "The default settings file … defaults.psd1 is missing" | Extract the whole ZIP: `defaults.psd1` sits next to the scripts |
+| "unknown setting …" | A typo in a setting name in `config.psd1`: compare with `defaults.psd1` |
 | "No access to \\\\…\\Migrate" | The server is off, the `StoreRoot` path is wrong, or the account has no permissions on the share |
 | "Folder D:\\Migrate does not exist (StoreRoot in config.psd1)" | The folder on the admin PC was not created, or the USB drive is not connected or got another letter |
 | "Cannot reach the domain controller" or "Cannot reach AD" | The DC is unavailable. If `DcIp` is set in `config.psd1`, check that the address is right |
@@ -229,7 +265,7 @@ Once a day the window asks GitHub in the background for the latest version and, 
 The window downloads nothing by itself. Without internet the check silently does nothing; to turn it off: `UpdateCheck = $false` in `config.psd1`.
 
 To update: download the ZIP of the new version, unblock it (`Unblock-File`), replace the files in the window folder. Do not touch `config.psd1` and the `logs` folder.
-New settings are in `config.example.en.psd1`; for what changed, see "Versions". Without the new settings the window works with the defaults.
+New settings arrive in `defaults.psd1` with their defaults, `config.psd1` does not need changes. For what changed, see "Versions".
 
 To release a version (for those who maintain the repository or a fork): bump `$script:AppVersion` in `profile-move.ps1`, add an entry to "Versions" in README.md and this file, then tag:
 
@@ -261,6 +297,7 @@ One test PC will be both the old and the new one: after "Capture" the test user'
 
 ## Versions
 
+- **1.5.1** (2026-11-09): short `config.psd1`. Defaults moved to `defaults.psd1`, `config.psd1` holds only your own values: storage, domain, what to transfer. Folders and browsers are set with lists of keys (`Folders = @('Desktop', 'Signatures')`, `Browsers = @('Chrome', 'Firefox')`), your own are added as blocks to the same list. A typo in a setting name is now an error instead of a silent default. A full `config.psd1` from 1.4 and 1.5 works as before.
 - **1.5** (2026-11-08): "Move now" button (capture and restore right away when both PCs are on); HTML transfer report for printing and signing ("Report" button, `Act` and `OrgName` in `config.psd1`); copy encryption with a password (7-Zip, AES-256; `Encrypt`, `SevenZip`, `StagingDir`); new version check on GitHub (`UpdateCheck`) and releases with a ZIP; English interface (`Language`, `lang\en.psd1`, `config.example.en.psd1`, this file). If the window is closed while working, it stops copying, restores the Remote Registry service and marks the copy "with errors".
 - **1.4** (2026-11-08): first public version. Organization settings moved to `config.psd1` (example: `config.example.psd1`), the domain defaults to `%USERDNSDOMAIN%`, `DcIp` and the admin PC check are optional, folder and browser checkboxes are built from `config.psd1`, besides Yandex Browser it transfers Chromium-Gost, Chrome, Edge and Firefox (and any browser added to `Browsers`), CryptoPro can be turned off. The copy storage can be a share, a folder or a USB drive on the admin PC.
 - **1.3**: transfer percentage, clear reasons for files not copied (names longer than 255 bytes for a NAS), warning when not running on an admin PC.

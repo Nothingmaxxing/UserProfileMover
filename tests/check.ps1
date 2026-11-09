@@ -1,4 +1,4 @@
-﻿# Проверки без Windows и без сети: синтаксис скриптов, config.example.psd1 и логика функций окна.
+﻿# Проверки без Windows и без сети: синтаксис скриптов, настройки (defaults.psd1 и примеры config) и логика функций окна.
 # Запуск: pwsh -File tests/check.ps1 (PowerShell 7 на Linux или Windows) или в Windows PowerShell 5.1.
 # Код выхода = число проваленных проверок
 $ErrorActionPreference = 'Stop'
@@ -45,16 +45,22 @@ function Write-Log { param([string]$Text, [string]$Level = 'info') $script:LogLi
 function Show-Msg([string]$Text, [string]$Icon = 'Information', [string]$Buttons = 'OK') { $script:Shown = @{ Text = $Text; Icon = $Icon; Buttons = $Buttons }; return $script:MsgAnswer }
 $script:MsgAnswer = 'Cancel'
 
-. (Get-Fn 'T', 'Set-Language', 'Initialize-Browsers', 'Get-ExcludeArgs', 'Test-BrowserRunning', 'Wait-BrowserClosed', 'Get-BrowserJobs', 'Test-Locked',
+. (Get-Fn 'T', 'Set-Language', 'Merge-Config', 'Read-Config', 'Initialize-Browsers', 'Get-ExcludeArgs', 'Test-BrowserRunning', 'Wait-BrowserClosed', 'Get-BrowserJobs', 'Test-Locked',
     'Get-ErrCode', 'New-ItemResult', 'Write-ItemLog', 'Get-CopyHas', 'Format-Size', 'Format-Span', 'Get-Worst', 'ConvertFrom-RoboError',
     'Invoke-Move', 'Show-Result', 'ConvertTo-HtmlText', 'Get-ActStatus', 'New-Act')
 Set-Language 'ru' $root   # проверки ниже ждут русские тексты
 
-# ---------------------------------------------------------------- 3. config.example.psd1 и браузеры
+# ---------------------------------------------------------------- 3. настройки: defaults.psd1 + config.psd1, браузеры
 
-$cfg = Import-PowerShellDataFile (Join-Path $root 'config.example.psd1')
+$defaults = Import-PowerShellDataFile (Join-Path $root 'defaults.psd1')
+$example = Import-PowerShellDataFile (Join-Path $root 'config.example.psd1')
+Check 'defaults: StoreRoot пустой, задаётся в config.psd1' (-not $defaults.StoreRoot)
+Check ('config.example: коротко, {0} настроек' -f $example.Count) ($example.Count -le 12)
+$cfg = Merge-Config $defaults $example
 $script:Cfg = $cfg
 Check 'config: StoreRoot пример' ($cfg.StoreRoot -like '\\*')
+Check 'config: остальное из defaults.psd1' ($cfg.RetentionDays -eq 30 -and $cfg.Encrypt -eq 'Optional' -and $cfg.DpapiPath -like '*{SID}' -and $cfg.Language -eq 'auto')
+Check 'config: папки' ((@($cfg.Folders | ForEach-Object { $_.Key }) -join ',') -eq 'Desktop,Documents,Downloads')
 $b = @(Initialize-Browsers $cfg)
 Check 'config: 5 браузеров' ($b.Count -eq 5)
 Check 'config: ключи браузеров' ((($b | ForEach-Object { $_.Key }) -join ',') -eq 'Yandex,ChromiumGost,Chrome,Edge,Firefox')
@@ -80,6 +86,58 @@ Check 'старый config: свои исключения' ($bo[0].ExcludeDirs.C
 Check 'старый config: exe' ($bo[0].Exe.Count -eq 3)
 $legacy.EnableYandex = $false
 Check 'старый config: EnableYandex = $false' (@(Initialize-Browsers $legacy).Count -eq 0)
+
+# Списки в config.psd1: ключи из defaults.psd1, свои блоки, блоки поверх defaults.psd1
+$keysOf = { param($x) (@($x | ForEach-Object { $_.Key }) -join ',') }
+$m = Merge-Config $defaults @{ StoreRoot = 'D:\Migrate' }
+Check 'только StoreRoot: папки и браузеры по умолчанию' ((& $keysOf $m.Folders) -eq 'Desktop,Documents,Downloads' -and (& $keysOf (Initialize-Browsers $m)) -eq 'Yandex,ChromiumGost,Chrome,Edge,Firefox')
+$m = Merge-Config $defaults @{ StoreRoot = 'x'; Folders = @('Desktop', 'signatures'); Browsers = @('chrome', 'Firefox') }
+Check 'ключи: выключенная по умолчанию папка включается' ((& $keysOf $m.Folders) -eq 'Desktop,Signatures' -and $m.Folders[1].Path -like '*\Signatures')
+Check 'ключи: браузеры по ключу без учёта регистра' ((& $keysOf (Initialize-Browsers $m)) -eq 'Chrome,Firefox')
+$m = Merge-Config $defaults @{ StoreRoot = 'x'; Browsers = @('Chrome', @{ Key = 'Firefox'; Exe = @('D:\FF\firefox.exe') }) }
+$bf = @(Initialize-Browsers $m)[1]
+Check 'блок поверх defaults.psd1: меняет только своё' ($bf.Exe.Count -eq 1 -and $bf.Exe[0] -eq 'D:\FF\firefox.exe' -and ($bf.LockFiles -join '|') -eq 'Profiles\*\parent.lock' -and $bf.Dpapi -eq $false)
+$m = Merge-Config $defaults @{ StoreRoot = 'x'; Browsers = @('Chrome', @{ Key = 'Brave'; Title = 'Brave'; UserData = @('AppData\Local\BraveSoftware\Brave-Browser\User Data') }) }
+$bb = @(Initialize-Browsers $m)
+Check 'свой браузер: с настройками Chromium' ((& $keysOf $bb) -eq 'Chrome,Brave' -and ($bb[1].LockFiles -join '|') -eq 'lockfile|Default\Network\Cookies' -and $bb[1].Dpapi)
+$m = Merge-Config $defaults @{ StoreRoot = 'x'; Folders = @('Desktop', @{ Key = 'Downloads'; Enabled = $false }, @{ Key = 'Scans'; Title = 'Сканы'; Path = 'Scans' }) }
+Check 'папки: Enabled = $false и своя папка' ((& $keysOf $m.Folders) -eq 'Desktop,Scans')
+Check 'ошибка: нет такого ключа' (Throws { Merge-Config $defaults @{ StoreRoot = 'x'; Browsers = @('Opera') } } '*Opera*defaults.psd1*Chrome*')
+Check 'ошибка: опечатка в настройке' (Throws { Merge-Config $defaults @{ StoreRoot = 'x'; AdminGroup = @('IT') } } '*AdminGroup*')
+Check 'ошибка: не ключ и не блок' (Throws { Merge-Config $defaults @{ StoreRoot = 'x'; Folders = @(5) } } '*Folders*5*')
+Check 'ошибка: Key папки с пробелом' (Throws { Merge-Config $defaults @{ StoreRoot = 'x'; Folders = @(@{ Key = 'My Scans'; Title = 'x'; Path = 'y' }) } } '*Key*')
+Check 'ошибка: папка повторяется' (Throws { Merge-Config $defaults @{ StoreRoot = 'x'; Folders = @('Desktop', 'desktop') } } '*Desktop*')
+Check 'ошибка: у папки нет Path' (Throws { Merge-Config $defaults @{ StoreRoot = 'x'; Folders = @(@{ Key = 'X'; Title = 'x' }) } } '*Path*')
+$legacy.EnableYandex = $true
+$lb = @(Initialize-Browsers (Merge-Config $defaults $legacy))
+Check 'старый config через defaults.psd1: один Яндекс' ($lb.Count -eq 1 -and $lb[0].Key -eq 'Yandex' -and $lb[0].ExcludeDirs.Count -eq 3)
+
+# config.psd1 из полного примера 1.5 (так настроены те, кто ставил 1.5): то же, что с defaults.psd1
+$old = Merge-Config $defaults (Import-PowerShellDataFile (Join-Path $PSScriptRoot 'config-1.5.psd1'))
+$sigB = { param($x) (@($x) | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $_.Key, $_.Title, ($_.UserData -join ';'), ($_.Exe -join ';'), ($_.LockFiles -join ';'), ($_.ExcludeDirs -join ';'), ($_.ExcludeFiles -join ';'), $_.Dpapi, $_.Note }) -join '#' }
+$sigF = { param($x) (@($x) | ForEach-Object { '{0}|{1}|{2}' -f $_.Key, $_.Title, $_.Path }) -join '#' }
+$cur = Merge-Config $defaults @{ StoreRoot = $old.StoreRoot }
+$same = @($defaults.Keys | Where-Object { $_ -notin @('Folders', 'Browsers') -and ((@($old[$_]) -join '|') -cne (@($cur[$_]) -join '|')) })
+foreach ($x in $same) { Write-Host ('   отличается: {0}' -f $x) }
+Check 'config 1.5: настройки как в defaults.psd1' ($same.Count -eq 0)
+Check 'config 1.5: те же папки' ((& $sigF $old.Folders) -ceq (& $sigF $cur.Folders))
+Check 'config 1.5: те же браузеры' ((& $sigB (Initialize-Browsers $old)) -ceq (& $sigB (Initialize-Browsers $cur)))
+
+# Read-Config: файлы рядом с окном
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ('upm-check-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmp | Out-Null
+try {
+    Check 'Read-Config: нет defaults.psd1' (Throws { Read-Config $tmp } '*defaults.psd1*')
+    Copy-Item -LiteralPath (Join-Path $root 'defaults.psd1') -Destination $tmp
+    Check 'Read-Config: нет config.psd1' (Throws { Read-Config $tmp } '*config.psd1*')
+    Copy-Item -LiteralPath (Join-Path $root 'config.example.psd1') -Destination (Join-Path $tmp 'config.psd1')
+    $rc = Read-Config $tmp
+    Check 'Read-Config: пример' ($rc.StoreRoot -like '\\*' -and @($rc.Folders).Count -eq 3 -and $rc.RoboThreads -eq 8)
+    # как в README, «Добавить свой браузер»: ключи и блоки в одном списке
+    $own = "@{`r`n    StoreRoot = 'D:\Migrate'`r`n    Browsers = @(`r`n        'Yandex', 'Chrome'`r`n        @{ Key = 'Brave'; Title = 'Brave'; UserData = @('AppData\Local\BraveSoftware\Brave-Browser\User Data') }`r`n    )`r`n}`r`n"
+    [IO.File]::WriteAllText((Join-Path $tmp 'config.psd1'), $own, (New-Object Text.UTF8Encoding($true)))
+    Check 'Read-Config: ключи и свой блок в одном списке' ((@(Initialize-Browsers (Read-Config $tmp) | ForEach-Object { $_.Key }) -join ',') -eq 'Yandex,Chrome,Brave')
+} finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
 $bad = $cfg.Clone()
 $bad.Browsers = @(@{ Key = 'Chrome Beta'; Title = 'X'; UserData = @('a') })
@@ -316,9 +374,8 @@ foreach ($f in @('profile-move.ps1', 'start.ps1')) {
         if ($x.Kind -in @('StringExpandable', 'HereStringExpandable') -and $x.Text -match '[Ѐ-ӿ]') { $naked.Add(('{0}:{1} {2}' -f $f, $x.Extent.StartLineNumber, $x.Text)) }
     }
 }
-$cfgRu = Import-PowerShellDataFile (Join-Path $root 'config.example.psd1')
-foreach ($x in $cfgRu.Folders) { [void]$keys.Add([string]$x.Title) }
-foreach ($x in $cfgRu.Browsers) { [void]$keys.Add([string]$x.Title); if ($x.Note) { [void]$keys.Add([string]$x.Note) } }
+foreach ($x in $defaults.Folders) { [void]$keys.Add([string]$x.Title) }
+foreach ($x in $defaults.Browsers) { [void]$keys.Add([string]$x.Title); if ($x.Note) { [void]$keys.Add([string]$x.Note) } }
 $need = @($keys | Where-Object { $_ -match '[^\x00-\x7F]' })
 foreach ($x in $naked) { Write-Host ('   без T: {0}' -f $x) }
 Check 'перевод: весь русский текст скриптов в T' ($naked.Count -eq 0)
@@ -341,36 +398,27 @@ Check 'язык en: перевод с отступом' ((T '   профиль: 
 Check 'язык en: нет перевода, остаётся как есть' ((T 'Такой строки нет') -ceq 'Такой строки нет' -and (T 'Chromium-Gost') -ceq 'Chromium-Gost')
 Check 'язык en: даты' ($script:DateFmt -eq 'yyyy-MM-dd HH:mm' -and $script:DayFmt -eq 'yyyy-MM-dd')
 Check 'язык en: размер' ((Format-Size 3GB) -like '3?0 GB' -and (Format-Size 10) -eq '10 B')
-$ben = @(Initialize-Browsers $cfgRu)
+$ben = @(Initialize-Browsers (Merge-Config $defaults $example))
 Check 'язык en: названия браузеров и примечания' ($ben[0].Title -eq 'Yandex Browser' -and $ben[2].Note -like 'Since version 127*')
 Set-Language 'xx' $root
 Check 'язык без файла перевода: русский' ($script:Lang -eq 'ru' -and (T 'Отмена') -ceq 'Отмена' -and $script:DateFmt -eq 'dd.MM.yyyy HH:mm')
 Set-Language 'ru' $root
 Check 'язык ru' ((T '   профиль: {0}{1}') -ceq '   профиль: {0}{1}')
-$fnSame = foreach ($n in @('T', 'Set-Language')) {
+$fnSame = foreach ($n in @('T', 'Set-Language', 'Merge-Config', 'Read-Config')) {
     $x = @($asts['start.ps1'].FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $n }, $false))
     ($x.Count -eq 1 -and $x[0].Extent.Text -ceq $all[$n])
 }
-Check 'T и Set-Language в start.ps1 такие же, как в profile-move.ps1' (@($fnSame | Where-Object { -not $_ }).Count -eq 0)
+Check 'T, Set-Language, Merge-Config и Read-Config в start.ps1 такие же, как в profile-move.ps1' (@($fnSame | Where-Object { -not $_ }).Count -eq 0)
 
-# Английский пример настроек: те же параметры и пути, что в config.example.psd1 (свои названия, примечания и включённость)
-$cfgEn = Import-PowerShellDataFile (Join-Path $root 'config.example.en.psd1')
-Check 'config.example.en: те же параметры' (((@($cfgRu.Keys | Sort-Object) -join ',') -ceq (@($cfgEn.Keys | Sort-Object) -join ',')))
-$diff = New-Object System.Collections.Generic.List[string]
-foreach ($k in $cfgRu.Keys) {
-    if ($k -in @('Folders', 'Browsers', 'EnableCryptoPro')) { continue }
-    if ((@($cfgRu[$k]) -join '|') -cne (@($cfgEn[$k]) -join '|')) { $diff.Add($k) }
-}
-$fr = @($cfgRu.Folders | ForEach-Object { '{0}={1}' -f $_.Key, $_.Path }) -join ';'
-$fe = @($cfgEn.Folders | ForEach-Object { '{0}={1}' -f $_.Key, $_.Path }) -join ';'
-if ($fr -cne $fe) { $diff.Add('Folders') }
-$sig = { param($x) (@('UserData', 'Exe', 'LockFiles', 'ExcludeDirs', 'ExcludeFiles', 'Dpapi') | ForEach-Object { '{0}:{1}' -f $_, (@($x[$_]) -join '|') }) -join ';' }
-$br = @{}; foreach ($x in $cfgRu.Browsers) { $br[$x.Key] = & $sig $x }
-foreach ($x in $cfgEn.Browsers) { if (-not $br.ContainsKey($x.Key) -or $br[$x.Key] -cne (& $sig $x)) { $diff.Add('Browsers.' + $x.Key) } }
-if (@($cfgEn.Browsers).Count -ne @($cfgRu.Browsers).Count) { $diff.Add('Browsers') }
+# Английский пример настроек: те же параметры и значения, что в config.example.psd1, кроме браузеров и КриптоПро
+$exEn = Import-PowerShellDataFile (Join-Path $root 'config.example.en.psd1')
+Check 'config.example.en: те же параметры' (((@($example.Keys | Sort-Object) -join ',') -ceq (@($exEn.Keys | Sort-Object) -join ',')))
+$diff = @($example.Keys | Where-Object { $_ -notin @('Browsers', 'EnableCryptoPro') -and ((@($example[$_]) -join '|') -cne (@($exEn[$_]) -join '|')) })
 foreach ($x in $diff) { Write-Host ('   отличается: {0}' -f $x) }
-Check 'config.example.en: значения и пути как в config.example.psd1' ($diff.Count -eq 0)
+Check 'config.example.en: значения как в config.example.psd1' ($diff.Count -eq 0)
+$cfgEn = Merge-Config $defaults $exEn
 Check 'config.example.en: включены Chrome, Edge, Firefox' ((@(Initialize-Browsers $cfgEn | ForEach-Object { $_.Key }) -join ',') -eq 'Chrome,Edge,Firefox')
+Check 'config.example.en: КриптоПро выключен' ($cfgEn.EnableCryptoPro -eq $false)
 $readmeEn = [IO.File]::ReadAllText((Join-Path $root 'README.en.md'), [Text.Encoding]::UTF8)
 Check 'README.en: в «Versions» первой идёт AppVersion' ($readmeEn -match '## Versions\s+- \*\*([\d.]+)\*\*' -and $Matches[1] -eq $appVer)
 Check 'README.en: раздел «Preparing the storage»' ($readmeEn -match '(?m)^#+ Preparing the storage')
